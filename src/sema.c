@@ -215,11 +215,16 @@ static Type *resolve_type(Sema *s, Type *ty)
                 return sym->type;
             }
         }
-        /* Resolve member types and compute layout if members are present */
-        if (ty->members && !ty->is_complete) {
+        /* Resolve member types and recompute layout.
+         * The parser may have computed offsets using incomplete member types
+         * (e.g., struct A's size was 0 when struct B was parsed).  Always
+         * re-lay-out once we have complete member information.            */
+        if (ty->members) {
+            /* Temporarily clear is_complete to allow relayout */
+            ty->is_complete = false;
             for (Member *m = ty->members; m; m = m->next)
                 m->ty = resolve_type(s, m->ty);
-            type_layout_struct(ty);
+            type_layout_struct(ty);   /* sets is_complete = true */
         }
         return ty;
     }
@@ -1091,6 +1096,8 @@ static Type *analyze_expr(Sema *s, Node *node)
                 node->member_name ? node->member_name : "?");
             return set_ty(node, ty_int);
         }
+        /* Re-resolve obj_ty in case it's a forward-declared struct */
+        obj_ty = resolve_type(s, obj_ty);
         for (Member *m = obj_ty->members; m; m = m->next) {
             if (m->name && node->member_name &&
                 strcmp(m->name, node->member_name) == 0) {
@@ -1339,6 +1346,12 @@ int sema_is_assignable(Sema *s, Type *to, Type *from)
     /* array decays to pointer */
     if (to->kind == TY_PTR && from->kind == TY_ARRAY)
         return type_is_compatible(to->base, from->base);
+
+    /* function decays to pointer-to-function */
+    if (to->kind == TY_PTR && from->kind == TY_FUNC)
+        return 1;
+    if (to->kind == TY_FUNC && from->kind == TY_PTR && from->base && from->base->kind == TY_FUNC)
+        return 1;
 
     /* enum ↔ integer */
     if (to->kind == TY_ENUM && type_is_integer(from)) return 1;

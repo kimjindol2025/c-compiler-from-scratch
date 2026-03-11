@@ -145,10 +145,16 @@ static int local_alloc(LocalCtx *ctx, const char *name, Type *ty) {
     if (size  <= 0) size  = 8;
     if (align <= 0) align = 8;
 
-    /* Align downward */
+    /* Align downward (toward more-negative).
+     * C integer division truncates toward zero, so for negative values
+     * (-12 / 8) = -1, but we need floor(-12/8) = -2.
+     * Use: floor_div(a, b) = -((-a + b-1) / b) for a < 0, b > 0.
+     */
     ctx->next_offset -= size;
-    ctx->next_offset  = (ctx->next_offset / align) * align;
-    if (ctx->next_offset > -size) ctx->next_offset = -align;
+    if (align > 1) {
+        int neg = -ctx->next_offset;
+        ctx->next_offset = -(((neg) + align - 1) / align * align);
+    }
 
     LocalVar *v = calloc(1, sizeof(LocalVar));
     v->name   = strdup(name);
@@ -954,7 +960,23 @@ static void gen_expr(GenCtx *ctx, Node *n) {
            Safe to do for all calls since we don't track variadic at this point. */
         enc_xor_rr(e, SZ_32, REG_RAX, REG_RAX);  /* xor eax, eax */
 
+        /* Determine if this is a direct call (function name) or indirect
+         * (function pointer in a variable).  An ND_VAR/ND_IDENT is a direct
+         * call only when the local variable table has no entry for it (i.e.
+         * it resolves to a global function symbol, not a local var).  A local
+         * variable with pointer-to-function type must be called indirectly. */
+        bool is_direct = false;
         if (callee->kind == ND_IDENT || callee->kind == ND_VAR) {
+            LocalVar *lv = local_find(&ctx->locals, callee->ident.name);
+            if (!lv) {
+                /* No local variable — it's a global function symbol */
+                is_direct = true;
+            } else {
+                /* Local var: might hold a function pointer → indirect call */
+                is_direct = false;
+            }
+        }
+        if (is_direct) {
             buf_write8(&e->buf, 0xE8);  /* CALL rel32 */
             size_t reloc_off = enc_size(e);
             buf_write32(&e->buf, 0);    /* placeholder: linker fills this */
