@@ -12,6 +12,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#include "../include/preprocessor.h"
 #include "../include/lexer.h"
 #include "../include/ast.h"
 #include "../include/parser.h"
@@ -88,6 +89,9 @@ int main(int argc, char **argv) {
     bool flag_S = false;   /* emit assembly */
     bool flag_c = false;   /* compile to .o only */
     bool verbose = false;
+    /* Preprocessor defines from command line */
+    char *pp_defines[64]; int n_pp_defines = 0;
+    char *pp_incpaths[64]; int n_pp_incpaths = 0;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -106,6 +110,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             output_file = argv[++i];
+        } else if (strncmp(argv[i], "-D", 2) == 0) {
+            if (n_pp_defines < 64) pp_defines[n_pp_defines++] = argv[i] + 2;
+        } else if (strncmp(argv[i], "-I", 2) == 0) {
+            if (n_pp_incpaths < 64) pp_incpaths[n_pp_incpaths++] = argv[i] + 2;
         } else if (argv[i][0] == '-') {
             /* Ignore unknown flags (could be -Wall, -std=c11, etc.) */
             if (verbose) fprintf(stderr, "ccc: ignoring flag '%s'\n", argv[i]);
@@ -142,6 +150,29 @@ int main(int argc, char **argv) {
     if (verbose) fprintf(stderr, "ccc: reading '%s'\n", input_file);
     char *src = read_file(input_file);
     if (!src) return 1;
+
+    /* ---- Stage 1.5: Preprocess ---- */
+    if (verbose) fprintf(stderr, "ccc: preprocessing\n");
+    Preprocessor *pp = pp_new();
+    for (int i = 0; i < n_pp_defines; i++) pp_define(pp, pp_defines[i], NULL);
+    for (int i = 0; i < n_pp_incpaths; i++) pp_add_include_path(pp, pp_incpaths[i]);
+    /* Add directory of input file as include search path */
+    {
+        char dir_buf[1024];
+        strncpy(dir_buf, input_file, sizeof(dir_buf)-1); dir_buf[sizeof(dir_buf)-1] = '\0';
+        char *slash = strrchr(dir_buf, '/');
+        if (slash) { *slash = '\0'; pp_add_include_path(pp, dir_buf); }
+        else        { pp_add_include_path(pp, "."); }
+    }
+    char *pp_src = pp_process_string(pp, src, input_file);
+    free(src);
+    if (!pp_src || pp->error_count > 0) {
+        fprintf(stderr, "ccc: preprocessor error(s); aborting\n");
+        pp_free(pp); free(pp_src);
+        return 1;
+    }
+    pp_free(pp);
+    src = pp_src;
 
     /* ---- Stage 2: Lex ---- */
     if (verbose) fprintf(stderr, "ccc: lexing\n");

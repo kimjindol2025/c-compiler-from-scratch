@@ -8,7 +8,8 @@ INC_DIR   = include
 TEST_DIR  = tests
 BUILD_DIR = build
 
-SRCS = $(SRC_DIR)/lexer.c \
+SRCS = $(SRC_DIR)/preprocessor.c \
+       $(SRC_DIR)/lexer.c \
        $(SRC_DIR)/ast.c \
        $(SRC_DIR)/types.c \
        $(SRC_DIR)/symtable.c \

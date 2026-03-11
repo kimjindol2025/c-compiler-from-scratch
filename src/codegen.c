@@ -1485,33 +1485,70 @@ static void gen_function(CodeGen *cg, Node *fn) {
 
     /* Bind parameters to local variables */
     int nparams = fn->func.param_count;
-    for (int i = 0; i < nparams && i < NARG_REGS; i++) {
-        Node *param = fn->func.params[i];
-        Type *pty   = param->param.param_type;
-        if (!pty) {
-            /* default to int */
-            pty = calloc(1, sizeof(Type));
-            pty->kind = TY_INT; pty->size = 4; pty->align = 4;
+    bool is_variadic = fn->func_ty && fn->func_ty->is_variadic;
+
+    if (is_variadic) {
+        /*
+         * Variadic register save area:
+         * Save all 6 integer arg registers to consecutive 8-byte slots.
+         * Slots: [rbp-8]=rdi, [rbp-16]=rsi, [rbp-24]=rdx, [rbp-32]=rcx,
+         *        [rbp-40]=r8,  [rbp-48]=r9
+         *
+         * Named params get the first N slots; the rest hold variadic args.
+         * va_start(ap, last_param) = (char*)(&last_param) - 8
+         *   which points to the slot immediately below last_param.
+         */
+        for (int i = 0; i < NARG_REGS; i++) {
+            int off = -(i + 1) * 8;
+            enc_mov_mr(e, SZ_64, REG_RBP, REG_NONE, 1, off, ARG_REGS[i]);
         }
-        int off = local_alloc(&ctx.locals, param->param.name, pty);
-        /* Store arg register to local */
-        OpSize opsz = ty_opsize(pty);
-        enc_mov_mr(e, opsz, REG_RBP, REG_NONE, 1, off, ARG_REGS[i]);
-    }
-    /* Stack parameters (i >= 6) are at [rbp + 16 + (i-6)*8] */
-    for (int i = NARG_REGS; i < nparams; i++) {
-        Node *param = fn->func.params[i];
-        Type *pty   = param->param.param_type;
-        if (!pty) {
-            pty = calloc(1, sizeof(Type));
-            pty->kind = TY_INT; pty->size = 4; pty->align = 4;
+        /* Register named params to their respective slots */
+        for (int i = 0; i < nparams && i < NARG_REGS; i++) {
+            Node *param = fn->func.params[i];
+            Type *pty   = param->param.param_type;
+            if (!pty) {
+                pty = calloc(1, sizeof(Type));
+                pty->kind = TY_INT; pty->size = 4; pty->align = 4;
+            }
+            int off = -(i + 1) * 8;
+            LocalVar *v = calloc(1, sizeof(LocalVar));
+            v->name   = strdup(param->param.name);
+            v->offset = off;
+            v->type   = pty;
+            v->next   = ctx.locals.vars;
+            ctx.locals.vars = v;
         }
-        LocalVar *v = calloc(1, sizeof(LocalVar));
-        v->name   = strdup(param->param.name);
-        v->offset = 16 + (i - NARG_REGS) * 8;  /* positive from rbp */
-        v->type   = pty;
-        v->next   = ctx.locals.vars;
-        ctx.locals.vars = v;
+        /* Reserve the save area so local_alloc doesn't overlap it */
+        ctx.locals.next_offset = -(NARG_REGS * 8);
+    } else {
+        for (int i = 0; i < nparams && i < NARG_REGS; i++) {
+            Node *param = fn->func.params[i];
+            Type *pty   = param->param.param_type;
+            if (!pty) {
+                /* default to int */
+                pty = calloc(1, sizeof(Type));
+                pty->kind = TY_INT; pty->size = 4; pty->align = 4;
+            }
+            int off = local_alloc(&ctx.locals, param->param.name, pty);
+            /* Store arg register to local */
+            OpSize opsz = ty_opsize(pty);
+            enc_mov_mr(e, opsz, REG_RBP, REG_NONE, 1, off, ARG_REGS[i]);
+        }
+        /* Stack parameters (i >= 6) are at [rbp + 16 + (i-6)*8] */
+        for (int i = NARG_REGS; i < nparams; i++) {
+            Node *param = fn->func.params[i];
+            Type *pty   = param->param.param_type;
+            if (!pty) {
+                pty = calloc(1, sizeof(Type));
+                pty->kind = TY_INT; pty->size = 4; pty->align = 4;
+            }
+            LocalVar *v = calloc(1, sizeof(LocalVar));
+            v->name   = strdup(param->param.name);
+            v->offset = 16 + (i - NARG_REGS) * 8;  /* positive from rbp */
+            v->type   = pty;
+            v->next   = ctx.locals.vars;
+            ctx.locals.vars = v;
+        }
     }
 
     /* Generate body */

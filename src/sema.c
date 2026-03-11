@@ -778,9 +778,14 @@ static Type *analyze_expr(Sema *s, Node *node)
 
     /* --- Explicit cast --- */
     case ND_CAST: {
+        /* Parser writes union fields; sema reads flat — sync both */
+        if (!node->cast_ty && node->cast.to)   node->cast_ty  = node->cast.to;
+        if (!node->lhs     && node->cast.expr) node->lhs      = node->cast.expr;
         Type *to = resolve_type(s, node->cast_ty);
-        node->cast_ty = to;
-        analyze_expr(s, node->lhs); /* type-check operand */
+        node->cast_ty  = to;
+        node->cast.to  = to;
+        Node *inner = node->lhs ? node->lhs : node->cast.expr;
+        if (inner) { analyze_expr(s, inner); node->lhs = inner; node->cast.expr = inner; }
         return set_ty(node, to);
     }
 
