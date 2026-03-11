@@ -107,6 +107,12 @@ int sema_analyze(Sema *s, Node *program)
     if (!program) return 1;
     assert(program->kind == ND_PROGRAM);
 
+    /* Sync union → flat for ND_TRANSLATION_UNIT */
+    if (program->ndecls == 0 && program->unit.count > 0) {
+        program->ndecls = program->unit.count;
+        program->decls  = program->unit.decls;
+    }
+
     for (int i = 0; i < program->ndecls; i++)
         sema_toplevel(s, program->decls[i]);
 
@@ -126,6 +132,9 @@ void sema_toplevel(Sema *s, Node *decl)
     case ND_STRUCT_DEF:
     case ND_UNION_DEF:
     case ND_ENUM_DEF:
+        /* Register the struct/union/enum type in symtable */
+        if (decl->tag_def.type) resolve_type(s, decl->tag_def.type);
+        break;
     case ND_TYPEDEF:
         /* Handled inside resolve_type; nothing extra needed at top level */
         break;
@@ -233,6 +242,20 @@ static void process_var_decl(Sema *s, Node *node)
 {
     if (!node || node->kind != ND_VAR_DECL) return;
 
+    /* Sync union → flat: build Var from decl.* fields if decl_var is missing */
+    if (!node->decl_var && node->decl.name) {
+        Var *nv = calloc(1, sizeof(Var));
+        if (!nv) { perror("calloc"); exit(1); }
+        nv->name       = node->decl.name;
+        nv->ty         = node->decl.decl_type ? node->decl.decl_type : ty_int;
+        nv->is_static  = node->decl.is_static;
+        nv->is_extern  = node->decl.is_extern;
+        nv->is_register = node->decl.is_register;
+        node->decl_var = nv;
+    }
+    if (!node->decl_init && node->decl.init)
+        node->decl_init = node->decl.init;
+
     Var *v = node->decl_var;
     if (!v) return;
 
@@ -297,6 +320,46 @@ static void analyze_var_decl(Sema *s, Node *node)
 static void analyze_func_def(Sema *s, Node *node)
 {
     if (!node || node->kind != ND_FUNC_DEF) return;
+
+    /* Sync union → flat fields */
+    if (!node->fname && node->func.name)
+        node->fname = (char *)node->func.name;
+    if (!node->body && node->func.body)
+        node->body = node->func.body;
+    node->is_static = node->func.is_static;
+    node->is_inline = node->func.is_inline;
+    node->is_extern = node->func.is_extern;
+
+    /* Build func_ty (TY_FUNC) from union fields if not set.
+     * NOTE: type_func_returning stores the ptypes pointer directly (no copy),
+     * so we must NOT free ptypes after the call. */
+    if (!node->func_ty && node->func.ret_type) {
+        int np = node->func.param_count;
+        Type **ptypes = NULL;
+        if (np > 0) {
+            ptypes = malloc(np * sizeof(Type *));
+            if (!ptypes) { perror("malloc"); exit(1); }
+            for (int i = 0; i < np; i++)
+                ptypes[i] = node->func.params[i]->param.param_type
+                          ? node->func.params[i]->param.param_type : ty_int;
+        }
+        /* ptypes ownership transferred to the new TY_FUNC — do NOT free */
+        node->func_ty = type_func_returning(node->func.ret_type, ptypes, np, false);
+    }
+
+    /* Build params_var (Var* linked list) from func.params[] if not set */
+    if (!node->params_var && node->func.param_count > 0) {
+        Var *head = NULL, **tail = &head;
+        for (int i = 0; i < node->func.param_count; i++) {
+            Node *pm = node->func.params[i];
+            Var *pv = calloc(1, sizeof(Var));
+            if (!pv) { perror("calloc"); exit(1); }
+            pv->name = (char *)pm->param.name;
+            pv->ty   = pm->param.param_type ? pm->param.param_type : ty_int;
+            *tail = pv; tail = &pv->next;
+        }
+        node->params_var = head;
+    }
 
     Type *ft = node->func_ty ? node->func_ty : ty_int;
     ft = resolve_type(s, ft);
@@ -403,6 +466,7 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- Expression statement --- */
     case ND_EXPR_STMT:
+        if (!node->lhs) node->lhs = node->unary.operand; /* sync */
         analyze_expr(s, node->lhs);
         break;
 
@@ -429,6 +493,10 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- if statement --- */
     case ND_IF: {
+        /* Sync union → flat */
+        if (!node->cond) node->cond = node->if_.cond;
+        if (!node->then) node->then = node->if_.then;
+        if (!node->els)  node->els  = node->if_.else_;
         Type *ct = analyze_expr(s, node->cond);
         if (ct && !type_is_scalar(ct))
             ERR(s, node->line, "controlling expression of 'if' must be scalar");
@@ -439,6 +507,9 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- while loop --- */
     case ND_WHILE: {
+        /* Sync union → flat */
+        if (!node->cond) node->cond = node->while_.cond;
+        if (!node->body) node->body = node->while_.body;
         Type *ct = analyze_expr(s, node->cond);
         if (ct && !type_is_scalar(ct))
             ERR(s, node->line, "controlling expression of 'while' must be scalar");
@@ -450,6 +521,9 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- do-while loop --- */
     case ND_DO_WHILE: {
+        /* Sync union → flat */
+        if (!node->cond) node->cond = node->while_.cond;
+        if (!node->body) node->body = node->while_.body;
         s->in_loop++;
         analyze_stmt(s, node->body);
         s->in_loop--;
@@ -461,6 +535,11 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- for loop --- */
     case ND_FOR: {
+        /* Sync union → flat */
+        if (!node->init && node->for_.init) node->init = node->for_.init;
+        if (!node->cond && node->for_.cond) node->cond = node->for_.cond;
+        if (!node->step && node->for_.step) node->step = node->for_.step;
+        if (!node->body)                    node->body = node->for_.body;
         symtable_push_scope(s->symtable, 0);
         if (node->init) analyze_stmt(s, node->init);
         if (node->cond) {
@@ -478,6 +557,9 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- switch statement --- */
     case ND_SWITCH: {
+        /* Sync union → flat */
+        if (!node->lhs)  node->lhs  = node->switch_.expr;
+        if (!node->body) node->body = node->switch_.body;
         Type *et = analyze_expr(s, node->lhs);
         if (et && !type_is_integer(et))
             ERR(s, node->line, "switch expression must have integer type");
@@ -491,6 +573,9 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- case label --- */
     case ND_CASE: {
+        /* Sync union → flat: parser stores evaluated value in case_.value */
+        if (!node->body) node->body = node->case_.body;
+        if (!node->lhs)  node->case_val = node->case_.value; /* already evaluated */
         if (!s->in_switch)
             ERR(s, node->line, "'case' not in switch statement");
         if (node->lhs) {
@@ -506,6 +591,7 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- default label --- */
     case ND_DEFAULT:
+        if (!node->body) node->body = node->default_.body; /* sync */
         if (!s->in_switch)
             ERR(s, node->line, "'default' not in switch statement");
         if (node->body) analyze_stmt(s, node->body);
@@ -524,6 +610,7 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- return --- */
     case ND_RETURN: {
+        if (!node->ret_val) node->ret_val = node->return_.value; /* sync */
         Type *ret = s->current_func_ret;
         if (!ret) {
             ERR(s, node->line, "'return' outside function");
@@ -553,12 +640,15 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- goto --- */
     case ND_GOTO:
+        if (!node->goto_label) node->goto_label = (char *)node->goto_.label; /* sync */
         if (!node->goto_label || !node->goto_label[0])
             ERR(s, node->line, "empty goto label");
         break;
 
     /* --- label --- */
     case ND_LABEL: {
+        if (!node->label_name) node->label_name = (char *)node->label.name; /* sync */
+        if (!node->body)       node->body        = node->label.body;
         Symbol *lsym = symtable_define_label(s->symtable, node->label_name);
         (void)lsym;
         if (node->body) analyze_stmt(s, node->body);
@@ -647,8 +737,33 @@ static Type *analyze_expr(Sema *s, Node *node)
     case ND_VAR: {
         Var *v = node->var;
         if (!v) {
-            ERR(s, node->line, "internal: ND_VAR without Var pointer");
-            return set_ty(node, ty_int);
+            /* Parser only set ident.name; look up in symtable */
+            const char *name = node->ident.name;
+            if (!name || !name[0]) name = "?";
+            Symbol *sym = symtable_lookup(s->symtable, name);
+            if (!sym) {
+                ERR(s, node->line, "undeclared identifier '%s'", name);
+                return set_ty(node, ty_int);
+            }
+            if (sym->kind == SYM_ENUM_CONST) {
+                node->kind = ND_INT_LIT;
+                node->ival = sym->enum_val;
+                return set_ty(node, ty_int);
+            }
+            if (sym->kind == SYM_FUNC) {
+                /* Function used as value (e.g. function pointer) */
+                return set_ty(node, sym->type);
+            }
+            /* Build a Var from the symbol */
+            v = calloc(1, sizeof(Var));
+            if (!v) { perror("calloc"); exit(1); }
+            v->name      = (char *)sym->name;
+            v->ty        = sym->type;
+            v->is_global = sym->is_global;
+            v->is_static = sym->is_static;
+            v->is_extern = sym->is_extern;
+            v->offset    = sym->offset;
+            node->var    = v;
         }
         v->ty = resolve_type(s, v->ty);
         return set_ty(node, v->ty);
@@ -896,7 +1011,11 @@ static Type *analyze_expr(Sema *s, Node *node)
     }
 
     /* --- Compound assignment --- */
-    case ND_COMPOUND_ASSIGN: {
+    case ND_COMPOUND_ASSIGN:
+    case ND_ASSIGN_ADD: case ND_ASSIGN_SUB: case ND_ASSIGN_MUL:
+    case ND_ASSIGN_DIV: case ND_ASSIGN_MOD: case ND_ASSIGN_AND:
+    case ND_ASSIGN_OR:  case ND_ASSIGN_XOR: case ND_ASSIGN_SHL:
+    case ND_ASSIGN_SHR: {
         analyze_expr(s, node->lhs);
         analyze_expr(s, node->rhs);
         return set_ty(node, decay_of(node->lhs));
@@ -911,6 +1030,10 @@ static Type *analyze_expr(Sema *s, Node *node)
 
     /* --- Ternary --- */
     case ND_TERNARY: {
+        /* Sync union → flat */
+        if (!node->cond) node->cond = node->ternary.cond;
+        if (!node->then) node->then = node->ternary.then;
+        if (!node->els)  node->els  = node->ternary.else_;
         Type *ct = analyze_expr(s, node->cond);
         if (!type_is_scalar(ct))
             ERR(s, node->line, "ternary condition must be scalar");
@@ -958,44 +1081,54 @@ static Type *analyze_expr(Sema *s, Node *node)
 
     /* --- Member access: expr.member --- */
     case ND_MEMBER: {
+        /* Sync union → flat */
+        if (!node->lhs)         node->lhs         = node->member_access.obj;
+        if (!node->member_name) node->member_name  = (char *)node->member_access.member;
         Type *obj_ty = analyze_expr(s, node->lhs);
         if (obj_ty->kind != TY_STRUCT && obj_ty->kind != TY_UNION) {
             ERR(s, node->line,
                 "request for member '%s' in non-struct/union type",
-                node->member_name);
+                node->member_name ? node->member_name : "?");
             return set_ty(node, ty_int);
         }
         for (Member *m = obj_ty->members; m; m = m->next) {
-            if (m->name && strcmp(m->name, node->member_name) == 0) {
+            if (m->name && node->member_name &&
+                strcmp(m->name, node->member_name) == 0) {
                 node->member = m;
+                node->member_access.resolved = m; /* sync back for codegen */
                 return set_ty(node, m->ty);
             }
         }
         ERR(s, node->line, "struct/union has no member named '%s'",
-            node->member_name);
+            node->member_name ? node->member_name : "?");
         return set_ty(node, ty_int);
     }
 
     /* --- Pointer member access: expr->member --- */
     case ND_ARROW: {
+        /* Sync union → flat */
+        if (!node->lhs)         node->lhs        = node->member_access.obj;
+        if (!node->member_name) node->member_name = (char *)node->member_access.member;
         analyze_expr(s, node->lhs);
         Type *pd = decay_of(node->lhs);
         if (pd->kind != TY_PTR ||
             (pd->base->kind != TY_STRUCT && pd->base->kind != TY_UNION)) {
             ERR(s, node->line,
                 "request for member '%s' in non-pointer-to-struct/union",
-                node->member_name);
+                node->member_name ? node->member_name : "?");
             return set_ty(node, ty_int);
         }
         Type *struct_ty = pd->base;
         for (Member *m = struct_ty->members; m; m = m->next) {
-            if (m->name && strcmp(m->name, node->member_name) == 0) {
+            if (m->name && node->member_name &&
+                strcmp(m->name, node->member_name) == 0) {
                 node->member = m;
+                node->member_access.resolved = m; /* sync back for codegen */
                 return set_ty(node, m->ty);
             }
         }
         ERR(s, node->line, "struct/union has no member named '%s'",
-            node->member_name);
+            node->member_name ? node->member_name : "?");
         return set_ty(node, ty_int);
     }
 
@@ -1023,6 +1156,12 @@ static Type *analyze_expr(Sema *s, Node *node)
 
 static Type *analyze_call(Sema *s, Node *node)
 {
+    /* Sync union → flat: parser sets call.* fields */
+    if (!node->func_expr) {
+        node->func_expr = node->call.callee;
+        node->nargs     = node->call.arg_count;
+        node->args      = node->call.args;
+    }
     Type *callee_ty = analyze_expr(s, node->func_expr);
     callee_ty = type_decay(callee_ty);
 

@@ -568,7 +568,8 @@ static Type *parse_declarator_suffix(Parser *p, Type *ty) {
                         /* (void) — no parameters */
                     } else {
                         /* void * param — put back by re-parsing from saved */
-                        p->cur = saved;
+                        p->cur        = saved;
+                        p->peek_valid = false; /* invalidate lookahead after backtrack */
                         goto parse_params;
                     }
                 } else {
@@ -1608,6 +1609,20 @@ static Node *parse_external_decl(Parser *p) {
     /* Just a tag declaration: struct S { ... }; */
     if (check(p, TK_SEMICOLON)) {
         advance_tok(p);
+        /* Preserve struct/union/enum type so sema can register it */
+        if (base && (base->kind == TY_STRUCT || base->kind == TY_UNION)) {
+            NodeKind nk = (base->kind == TY_STRUCT) ? ND_STRUCT_DEF : ND_UNION_DEF;
+            Node *nd = alloc_node(p, nk, t.line, t.col);
+            nd->tag_def.type = base;
+            nd->tag_def.tag  = base->tag;
+            return nd;
+        }
+        if (base && base->kind == TY_ENUM) {
+            Node *nd = alloc_node(p, ND_ENUM_DEF, t.line, t.col);
+            nd->tag_def.type = base;
+            nd->tag_def.tag  = base->tag;
+            return nd;
+        }
         return alloc_node(p, ND_NULL_STMT, t.line, t.col);
     }
 
@@ -1635,6 +1650,7 @@ static Node *parse_external_decl(Parser *p) {
         Node *fn          = alloc_node(p, ND_FUNC_DEF, t.line, t.col);
         fn->func.name     = arena_strdup(p->arena, name ? name : "");
         fn->func.ret_type = ty->base; /* return type */
+        fn->func_ty       = ty;       /* full TY_FUNC for sema */
 
         /* Build parameter nodes */
         fn->func.param_count = ty->param_count;

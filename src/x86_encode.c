@@ -261,6 +261,15 @@ static void emit_modrm_mem(Buf *b, uint8_t reg_field, Reg base, Reg index, int s
         } else {
             buf_write32(b, (uint32_t)disp);
         }
+    } else if (base == REG_RSP || base == REG_R12) {
+        /* RSP/R12 base: displacement is only needed if disp != 0 */
+        if (disp == 0) {
+            /* mod=0 was used above — no displacement bytes needed */
+        } else if (disp >= -128 && disp <= 127) {
+            buf_write8(b, (uint8_t)(int8_t)disp);
+        } else {
+            buf_write32(b, (uint32_t)disp);
+        }
     } else if (has_disp8) {
         buf_write8(b, (uint8_t)(int8_t)disp);
     } else if (!has_disp0) {
