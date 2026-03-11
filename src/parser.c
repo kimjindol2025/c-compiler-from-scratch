@@ -558,15 +558,21 @@ static Type *parse_declarator_suffix(Parser *p, Type *ty) {
             bool variadic = false;
 
             if (!check(p, TK_RPAREN)) {
-                /* Check for (void) */
+                /* Check for (void) — empty parameter list */
                 if (peek_tok(p).kind == TK_VOID) {
-                    Token v = advance_tok(p);
-                    (void)v;
-                    if (!check(p, TK_RPAREN)) {
-                        /* It's a parameter of type void* etc */
-                        /* handle below */
+                    /* Peek ahead: if next-next is ')' it's (void), otherwise it's
+                       a real void* parameter — fall into normal param parsing */
+                    Token saved = p->cur;
+                    advance_tok(p); /* consume 'void' */
+                    if (check(p, TK_RPAREN)) {
+                        /* (void) — no parameters */
+                    } else {
+                        /* void * param — put back by re-parsing from saved */
+                        p->cur = saved;
+                        goto parse_params;
                     }
                 } else {
+                parse_params:;
                     do {
                         if (check(p, TK_ELLIPSIS)) {
                             advance_tok(p);
