@@ -240,20 +240,29 @@ void codegen_emit_elf(CodeGen *cg, const char *outfile) {
     Elf64_Rela *relas = calloc(nrelas, sizeof(Elf64_Rela));
     int ri = 0;
 
-    /* Build a name → sym_idx map for reloc targets */
-    /* Simple linear search (OK for small programs) */
+    /* Build a name → ELF sym_idx map using the same two-pass order as symtab.
+     * We must match the index assignment used above (locals first, then globals). */
     for (Reloc *r = cg->relocs; r; r = r->next, ri++) {
-        /* Find symbol index */
         int sidx = 0;
-        int scan = 1;
-        for (SymEntry *s = cg->syms; s; s = s->next, scan++) {
-            if (strcmp(s->name, r->sym_name) == 0) { sidx = scan; break; }
+        /* First pass: locals */
+        {
+            int scan = 1;
+            for (SymEntry *s = cg->syms; s; s = s->next) {
+                if (s->is_global) continue;
+                if (strcmp(s->name, r->sym_name) == 0) { sidx = scan; break; }
+                scan++;
+            }
         }
-        /* Also check backward order (syms is prepended) */
+        /* Second pass: globals */
         if (sidx == 0) {
-            /* Symbol not found: add as undefined */
-            sidx = 0; /* will link as STN_UNDEF */
+            int scan = first_global;
+            for (SymEntry *s = cg->syms; s; s = s->next) {
+                if (!s->is_global) continue;
+                if (strcmp(s->name, r->sym_name) == 0) { sidx = scan; break; }
+                scan++;
+            }
         }
+        /* Not found → STN_UNDEF (external symbol, linker resolves) */
 
         relas[ri].r_offset = (uint64_t)r->offset;
         relas[ri].r_info   = ELF64_R_INFO((uint32_t)sidx, (uint32_t)r->type);

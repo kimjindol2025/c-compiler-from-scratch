@@ -123,6 +123,8 @@ typedef struct LocalVar {
     char  *name;
     int    offset;    /* negative from rbp */
     Type  *type;
+    bool   is_static; /* true: global storage, access via RIP-relative reloc */
+    char  *global_name; /* unique global name for static locals */
     struct LocalVar *next;
 } LocalVar;
 
@@ -137,6 +139,46 @@ static LocalVar *local_find(LocalCtx *ctx, const char *name) {
         if (strcmp(v->name, name) == 0) return v;
     }
     return NULL;
+}
+
+/* Forward declaration needed by static_local_alloc */
+static int ty_size(Type *t);
+
+/* Allocate a static local: emit to .bss/.data, add to local table as "static". */
+static void static_local_alloc(CodeGen *cg, LocalCtx *lctx,
+                                const char *func_name, const char *var_name,
+                                Type *ty, Node *init_node) {
+    static int static_ctr = 0;
+    char gname[128];
+    snprintf(gname, sizeof(gname), ".%s.%s.%d", func_name ? func_name : "fn",
+             var_name ? var_name : "v", static_ctr++);
+
+    int sz    = ty ? ty_size(ty) : 4;
+    int align = ty ? (ty->align > 0 ? ty->align : 4) : 4;
+    if (sz <= 0) sz = 4;
+
+    if (init_node && (init_node->kind == ND_INT_LIT || init_node->kind == ND_CHAR_LIT)
+        && init_node->ival != 0) {
+        /* Non-zero initializer: .data */
+        uint8_t bytes[8] = {0};
+        long long v = init_node->ival;
+        memcpy(bytes, &v, sz < 8 ? sz : 8);
+        data_add(cg, gname, bytes, sz, align, false, false);
+    } else {
+        /* Zero initializer (or complex): .bss */
+        data_add(cg, gname, NULL, sz, align, true, false);
+    }
+    sym_add(cg, gname, CGSYM_OBJECT, 0, sz, false); /* local visibility */
+
+    /* Add to local ctx as static */
+    LocalVar *v = calloc(1, sizeof(LocalVar));
+    v->name        = strdup(var_name);
+    v->global_name = strdup(gname);
+    v->is_static   = true;
+    v->offset      = 0;
+    v->type        = ty;
+    v->next        = lctx->vars;
+    lctx->vars     = v;
 }
 
 static int local_alloc(LocalCtx *ctx, const char *name, Type *ty) {
@@ -186,6 +228,7 @@ typedef struct GenCtx {
 
     char      *return_label;
     int        return_type_size;
+    const char *func_name;   /* current function name (for static local naming) */
 } GenCtx;
 
 /* Forward declarations */
@@ -317,17 +360,20 @@ static void gen_lvalue(GenCtx *ctx, Node *n) {
     switch (n->kind) {
     case ND_VAR:
     case ND_IDENT: {
-        LocalVar *v = local_find(&ctx->locals, n->ident.name);
-        if (v) {
+        /* Use sema-resolved name if available, fallback to union field */
+        const char *lookup_name = (n->var && n->var->name) ? n->var->name : n->ident.name;
+        LocalVar *v = local_find(&ctx->locals, lookup_name);
+        if (v && !v->is_static) {
             enc_lea(e, REG_RAX, REG_RBP, REG_NONE, 1, v->offset);
         } else {
-            /* Global: RIP-relative LEA via ELF relocation (no encoder fixup) */
+            /* Global or static local: RIP-relative LEA via ELF relocation */
+            const char *sym_name = (v && v->is_static) ? v->global_name : lookup_name;
             buf_write8(&e->buf, 0x48);
             buf_write8(&e->buf, 0x8D);
             buf_write8(&e->buf, 0x05); /* LEA rax, [rip+rel32] */
             size_t reloc_off = enc_size(e);
             buf_write32(&e->buf, 0);
-            reloc_add(ctx->cg, reloc_off, n->ident.name, 2 /*R_X86_64_PC32*/, -4);
+            reloc_add(ctx->cg, reloc_off, sym_name, 2 /*R_X86_64_PC32*/, -4);
         }
         break;
     }
@@ -593,19 +639,21 @@ static void gen_expr(GenCtx *ctx, Node *n) {
 
     case ND_VAR:
     case ND_IDENT: {
-        LocalVar *v = local_find(&ctx->locals, n->ident.name);
-        if (v) {
+        const char *lookup_name = (n->var && n->var->name) ? n->var->name : n->ident.name;
+        LocalVar *v = local_find(&ctx->locals, lookup_name);
+        if (v && !v->is_static) {
             load_local(ctx, v->offset, v->type);
         } else {
-            /* Global variable: LEA rax, [rip + sym_name] via ELF reloc */
+            /* Global variable or static local: LEA rax, [rip + sym] via ELF reloc */
+            const char *sym_name = (v && v->is_static) ? v->global_name : lookup_name;
             buf_write8(&e->buf, 0x48);
             buf_write8(&e->buf, 0x8D);
             buf_write8(&e->buf, 0x05);
             size_t reloc_off = enc_size(e);
             buf_write32(&e->buf, 0);
-            reloc_add(ctx->cg, reloc_off, n->ident.name, 2 /*R_X86_64_PC32*/, -4);
+            reloc_add(ctx->cg, reloc_off, sym_name, 2 /*R_X86_64_PC32*/, -4);
             /* Then dereference if not a function pointer */
-            Type *ty = n->type;
+            Type *ty = v ? v->type : n->type;
             if (ty && ty->kind != TY_FUNC) {
                 enc_mov_rr(e, SZ_64, REG_RCX, REG_RAX);
                 load_ptr(ctx, ty);
@@ -886,9 +934,16 @@ static void gen_expr(GenCtx *ctx, Node *n) {
     }
 
     case ND_INDEX: {
-        gen_lvalue(ctx, n);  /* address in rax */
-        enc_mov_rr(e, SZ_64, REG_RCX, REG_RAX);
-        load_ptr(ctx, n->type);
+        gen_lvalue(ctx, n);  /* address of element in rax */
+        /* If the element type is an array, decay to pointer: leave address in rax.
+         * Otherwise load the value at that address. */
+        Type *elem_ty = n->type ? n->type : n->ty;
+        if (elem_ty && elem_ty->kind == TY_ARRAY) {
+            /* array decay: rax already holds the address, nothing more to do */
+        } else {
+            enc_mov_rr(e, SZ_64, REG_RCX, REG_RAX);
+            load_ptr(ctx, elem_ty);
+        }
         break;
     }
 
@@ -1107,6 +1162,15 @@ static void gen_stmt(GenCtx *ctx, Node *n) {
         Type *ty = n->decl.decl_type;
         int sz = ty ? ty_size(ty) : 8;
         if (sz <= 0) sz = 8;
+
+        if (n->decl.is_static) {
+            /* Static local: allocate in .bss/.data, not on the stack.
+             * Initialization runs once (at compile/link time for constants). */
+            static_local_alloc(ctx->cg, &ctx->locals,
+                               ctx->func_name, n->decl.name,
+                               ty, n->decl.init);
+            break;  /* No runtime initialization needed for static locals */
+        }
 
         int offset = local_alloc(&ctx->locals, n->decl.name, ty);
 
@@ -1360,8 +1424,9 @@ static void gen_function(CodeGen *cg, Node *fn) {
 
     /* Set up local context */
     GenCtx ctx = {0};
-    ctx.cg     = cg;
-    ctx.enc    = e;
+    ctx.cg        = cg;
+    ctx.enc       = e;
+    ctx.func_name = fname;
     ctx.locals.vars        = NULL;
     ctx.locals.next_offset = 0;
 
