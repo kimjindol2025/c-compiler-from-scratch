@@ -57,6 +57,10 @@ typedef struct LoopLabel {
 typedef struct SwitchCtx {
     char  *end_label;
     char  *default_label;
+    /* Two-pass dispatch: case labels pre-allocated in encounter order */
+    char **case_labels;   /* label per case */
+    int    ncases;
+    int    case_idx;      /* incremented as ND_CASE nodes are emitted */
     struct SwitchCtx *next;
 } SwitchCtx;
 

@@ -1323,24 +1323,67 @@ static void gen_stmt(GenCtx *ctx, Node *n) {
         break;
 
     case ND_SWITCH: {
-        char *end_lbl = cg_make_label(ctx->cg, "switch_end");
+        char *end_lbl     = cg_make_label(ctx->cg, "sw_end");
+        char *default_lbl = NULL;
 
+        /* Pass 1: pre-scan body compound, count cases, allocate labels */
+        Node *sw_body = n->switch_.body;
+        int ncases = 0;
+        if (sw_body && sw_body->kind == ND_COMPOUND) {
+            for (int i = 0; i < sw_body->compound.count; i++) {
+                Node *s = sw_body->compound.stmts[i];
+                if (s->kind == ND_CASE) ncases++;
+                else if (s->kind == ND_DEFAULT)
+                    default_lbl = cg_make_label(ctx->cg, "sw_def");
+            }
+        }
+        char **case_labels = calloc(ncases > 0 ? ncases : 1, sizeof(char *));
+        {
+            int ci = 0;
+            if (sw_body && sw_body->kind == ND_COMPOUND) {
+                for (int i = 0; i < sw_body->compound.count; i++) {
+                    if (sw_body->compound.stmts[i]->kind == ND_CASE)
+                        case_labels[ci++] = cg_make_label(ctx->cg, "case");
+                }
+            }
+        }
+
+        /* Evaluate switch expression → rax */
+        gen_expr(ctx, n->switch_.expr);
+
+        /* Dispatch: cmp rax, val; je caseN for each case */
+        {
+            int ci = 0;
+            if (sw_body && sw_body->kind == ND_COMPOUND) {
+                for (int i = 0; i < sw_body->compound.count; i++) {
+                    Node *s = sw_body->compound.stmts[i];
+                    if (s->kind == ND_CASE) {
+                        enc_cmp_ri(e, SZ_64, REG_RAX, (int32_t)s->case_.value);
+                        enc_jcc(e, CC_E, case_labels[ci++]);
+                    }
+                }
+            }
+        }
+        /* No case matched → jump to default or end */
+        enc_jmp(e, default_lbl ? default_lbl : end_lbl);
+
+        /* Set up SwitchCtx */
         SwitchCtx *sw = calloc(1, sizeof(SwitchCtx));
         sw->end_label     = strdup(end_lbl);
-        sw->default_label = NULL;
+        sw->default_label = default_lbl;
+        sw->case_labels   = case_labels;
+        sw->ncases        = ncases;
+        sw->case_idx      = 0;
         sw->next          = ctx->switch_stack;
         ctx->switch_stack = sw;
 
-        gen_expr(ctx, n->switch_.expr);
-        /* rax = switch value */
-        /* For simplicity: generate jump table style inline */
-        /* This is simplified — a real compiler would sort cases */
-        enc_push_r(e, REG_RAX);
-        gen_stmt(ctx, n->switch_.body);
-        enc_pop_r(e, REG_RCX);  /* discard saved value */
+        /* Pass 2: generate body — ND_CASE emits its label then body (natural fallthrough) */
+        gen_stmt(ctx, sw_body);
         enc_label(e, end_lbl);
 
         ctx->switch_stack = sw->next;
+        for (int i = 0; i < ncases; i++) free(sw->case_labels[i]);
+        free(sw->case_labels);
         if (sw->default_label) free(sw->default_label);
         free(sw->end_label); free(sw);
         free(end_lbl);
@@ -1348,21 +1391,21 @@ static void gen_stmt(GenCtx *ctx, Node *n) {
     }
 
     case ND_CASE: {
-        /* Compare against switch value (which is on stack from ND_SWITCH) */
-        char *skip_lbl = cg_make_label(ctx->cg, "case_skip");
-        /* Load switch value without popping */
-        enc_mov_rm(e, SZ_64, REG_RCX, REG_RSP, REG_NONE, 1, 0);
-        enc_cmp_ri(e, SZ_64, REG_RCX, (int32_t)n->case_.value);
-        enc_jcc(e, CC_NE, skip_lbl);
+        /* Emit pre-assigned label, then body — fallthrough is natural (no jump emitted) */
+        SwitchCtx *sw = ctx->switch_stack;
+        if (sw && sw->case_idx < sw->ncases)
+            enc_label(e, sw->case_labels[sw->case_idx++]);
         gen_stmt(ctx, n->case_.body);
-        enc_label(e, skip_lbl);
-        free(skip_lbl);
         break;
     }
 
-    case ND_DEFAULT:
+    case ND_DEFAULT: {
+        SwitchCtx *sw = ctx->switch_stack;
+        if (sw && sw->default_label)
+            enc_label(e, sw->default_label);
         gen_stmt(ctx, n->default_.body);
         break;
+    }
 
     case ND_GOTO: {
         char label[128];
