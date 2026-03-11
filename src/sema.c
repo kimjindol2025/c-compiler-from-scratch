@@ -688,11 +688,13 @@ static Node *implicit_cast_node(Node *expr, Type *to)
     if (!expr || !to) return expr;
     Node *cast = calloc(1, sizeof(Node));
     if (!cast) { perror("calloc"); exit(1); }
-    cast->kind    = ND_CAST;
-    cast->line    = expr->line;
-    cast->cast_ty = to;
-    cast->lhs     = expr;
-    cast->ty      = to;
+    cast->kind     = ND_CAST;
+    cast->line     = expr->line;
+    cast->cast_ty  = to;       /* flat field */
+    cast->cast.to  = to;       /* union field */
+    cast->lhs      = expr;     /* flat field */
+    cast->cast.expr = expr;    /* union field */
+    cast->ty       = to;
     return cast;
 }
 

@@ -974,17 +974,31 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         /* For register args: evaluate all, keep in order */
         /* For simplicity: evaluate, push all, then pop into arg regs */
 
-        /* Push all args onto stack first (in reverse order for stack args) */
+        /* System V AMD64 ABI stack argument passing:
+         *   - Args 0..5: rdi, rsi, rdx, rcx, r8, r9
+         *   - Args 6+: pushed right-to-left; callee reads at [rbp+16], [rbp+24], ...
+         *   - RSP must be 16-byte aligned BEFORE the call instruction.
+         *
+         * Alignment: after the callee-save pushes in our prologue, RSP is
+         * 16-byte aligned.  Stack args shift RSP by stack_args*8 bytes.
+         * If stack_args is odd, we need +8 pad BEFORE the stack args so that
+         * [callee's rbp+16] aligns with the first stack arg (not the pad).
+         * Register arg push/pop is net zero.
+         */
         int stack_args = nargs > NARG_REGS ? nargs - NARG_REGS : 0;
-        if (stack_args > 0) {
-            /* Push excess args right-to-left */
-            for (int i = nargs - 1; i >= NARG_REGS; i--) {
-                gen_expr(ctx, n->call.args[i]);
-                enc_push_r(e, REG_RAX);
-            }
+        bool need_align = (stack_args % 2) != 0;
+
+        /* Alignment pad FIRST — goes at the bottom of the stack frame
+         * (high address), so callee's [rbp+16] == first stack arg. */
+        if (need_align) enc_sub_ri(e, SZ_64, REG_RSP, 8);
+
+        /* Push excess args right-to-left so [RSP] = 7th arg before call */
+        for (int i = nargs - 1; i >= NARG_REGS; i--) {
+            gen_expr(ctx, n->call.args[i]);
+            enc_push_r(e, REG_RAX);
         }
 
-        /* Evaluate register args into temporary stack slots */
+        /* Evaluate register args into temporary stack slots (reverse order) */
         int reg_args = nargs < NARG_REGS ? nargs : NARG_REGS;
         for (int i = reg_args - 1; i >= 0; i--) {
             gen_expr(ctx, n->call.args[i]);
@@ -995,16 +1009,6 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         for (int i = 0; i < reg_args; i++) {
             enc_pop_r(e, ARG_REGS[i]);
         }
-
-        /* Align stack to 16 bytes if needed.
-           The function prologue ensures RSP ≡ 0 (mod 16) at the start of
-           the function body (after push rbp + sub rsp,N + 5 callee saves).
-           Register args are pushed then popped (net RSP change = 0), so RSP
-           stays aligned.  Stack args (pushed right-to-left, NOT popped before
-           call) shift RSP by stack_args*8 bytes — we need +8 if stack_args
-           is odd. */
-        bool need_align = (stack_args % 2) != 0;
-        if (need_align) enc_sub_ri(e, SZ_64, REG_RSP, 8);
 
         /* Call the function.
            For external symbols: emit CALL rel32 placeholder + ELF reloc.
@@ -1041,19 +1045,21 @@ static void gen_expr(GenCtx *ctx, Node *n) {
             enc_call_r(e, REG_RAX);
         }
 
-        /* Restore stack */
-        if (need_align) enc_add_ri(e, SZ_64, REG_RSP, 8);
-        if (stack_args > 0)
-            enc_add_ri(e, SZ_64, REG_RSP, stack_args * 8);
+        /* Restore stack: remove stack args + alignment pad in one shot */
+        int total_cleanup = stack_args + (need_align ? 1 : 0);
+        if (total_cleanup > 0)
+            enc_add_ri(e, SZ_64, REG_RSP, total_cleanup * 8);
 
         /* Result is in RAX */
         break;
     }
 
     case ND_CAST: {
-        gen_expr(ctx, n->cast.expr);
+        /* union field (cast.expr) set by parser; flat field (lhs) set by sema implicit_cast_node */
+        Node *cast_inner = n->cast.expr ? n->cast.expr : n->lhs;
+        gen_expr(ctx, cast_inner);
         /* Truncate/extend based on target type */
-        Type *to = n->cast.to;
+        Type *to = n->cast.to ? n->cast.to : n->cast_ty;
         if (!to) break;
         int sz = ty_size(to);
         if (sz == 1) {
