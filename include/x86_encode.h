@@ -205,3 +205,46 @@ void enc_syscall(Encoder *e);
 /* Get raw bytes (encoder owns the buffer) */
 const uint8_t *enc_bytes(const Encoder *e);
 size_t         enc_size(const Encoder *e);
+
+/* ===== SSE2 / scalar-double instructions =====
+ * Convention: xmm registers are passed as plain int (0-15).
+ * Binary ops use xmm0 op= xmm1 pattern.
+ */
+
+/* movsd xmm_dst, [rbp + off] */
+void enc_movsd_load(Encoder *e, int xmm_dst, int off);
+/* movsd [rbp + off], xmm_src */
+void enc_movsd_store(Encoder *e, int off, int xmm_src);
+/* movsd xmm_dst, xmm_src */
+void enc_movsd_rr(Encoder *e, int xmm_dst, int xmm_src);
+
+/* scalar-double binops: xmm0 op= xmm1 */
+void enc_addsd(Encoder *e);
+void enc_subsd(Encoder *e);
+void enc_mulsd(Encoder *e);
+void enc_divsd(Encoder *e);
+
+/* ucomisd xmm0, xmm1  (sets ZF/PF/CF for FP comparisons) */
+void enc_ucomisd(Encoder *e);
+
+/* cvttsd2si rax, xmm0  (truncating double→int64) */
+void enc_cvttsd2si(Encoder *e);
+/* cvtsi2sd xmm0, rax   (int64→double) */
+void enc_cvtsi2sd(Encoder *e);
+
+/* movsd xmm0, [rip+disp32]  — returns offset of disp field for relocation */
+size_t enc_movsd_rip(Encoder *e);
+
+/* push/pop xmm0 via stack (for binary op evaluation) */
+void enc_push_xmm0(Encoder *e);   /* sub rsp,8; movsd [rsp],xmm0 */
+void enc_pop_xmm1(Encoder *e);    /* movsd xmm1,[rsp]; add rsp,8  */
+
+/* MOVQ: transfer 64-bit bit-pattern between XMM and integer registers */
+void enc_movq_xmm0_rax(Encoder *e);  /* movq xmm0, rax */
+void enc_movq_xmm1_rax(Encoder *e);  /* movq xmm1, rax */
+void enc_movq_xmm1_rcx(Encoder *e);  /* movq xmm1, rcx */
+void enc_movq_rax_xmm0(Encoder *e);  /* movq rax, xmm0 */
+
+/* General form: movq xmmN, gpr and movq gpr, xmmN */
+void enc_movq_xmm_gpr(Encoder *e, int xmm_dst, Reg src);
+void enc_movq_gpr_xmm(Encoder *e, Reg dst, int xmm_src);

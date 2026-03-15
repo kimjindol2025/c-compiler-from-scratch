@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -g \
           -Wno-unused-parameter -Wno-unused-function \
-          -D_POSIX_C_SOURCE=200809L
+          -D_GNU_SOURCE
 
 SRC_DIR   = src
 INC_DIR   = include
@@ -18,6 +18,7 @@ SRCS = $(SRC_DIR)/preprocessor.c \
        $(SRC_DIR)/x86_encode.c \
        $(SRC_DIR)/codegen.c \
        $(SRC_DIR)/elf_writer.c \
+       $(SRC_DIR)/ir.c \
        $(SRC_DIR)/main.c
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
@@ -32,7 +33,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(TARGET): $(OBJS)
-	$(CC) -o $@ $^
+	$(CC) -o $@ $^ -ldl
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -I$(INC_DIR) -c -o $@ $<

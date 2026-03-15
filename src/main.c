@@ -2,12 +2,15 @@
  * main.c — ccc compiler driver
  *
  * Usage:
- *   ccc [-o output] [-S] [-c] [-v] input.c
+ *   ccc [-o output] [-S] [-c] [-v] [-ir] [-run] [-O1] input.c
  *
  *   -S        Emit assembly (AT&T syntax) to stdout or -o file
  *   -c        Compile to relocatable object file (.o)
  *   -o FILE   Output file name (default: a.out or input.o with -c)
  *   -v        Verbose: print pipeline stages
+ *   -ir       Dump 3-address IR to stderr (after lowering)
+ *   -O1       Enable IR optimizations (const folding + DCE)
+ *   -run      JIT: compile to memory and execute immediately (no ELF written)
  *   (default) Compile + link to executable via system linker
  */
 
@@ -18,6 +21,7 @@
 #include "../include/parser.h"
 #include "../include/sema.h"
 #include "../include/codegen.h"
+#include "../include/ir.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +63,7 @@ static int link_executable(const char *obj_file, const char *out_file, bool verb
     /* Use gcc as linker frontend — handles crt0, dynamic linker, libc */
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "gcc -o \"%s\" \"%s\"",
+             "gcc -o \"%s\" \"%s\" -lm",
              out_file, obj_file);
     if (verbose) fprintf(stderr, "ccc: link: %s\n", cmd);
     int ret = system(cmd);
@@ -86,9 +90,12 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     const char *input_file = NULL;
     const char *output_file = NULL;
-    bool flag_S = false;   /* emit assembly */
-    bool flag_c = false;   /* compile to .o only */
-    bool verbose = false;
+    bool flag_S   = false;  /* emit assembly */
+    bool flag_c   = false;  /* compile to .o only */
+    bool flag_run = false;  /* JIT: compile+run in memory */
+    bool flag_ir  = false;  /* dump IR to stderr */
+    bool flag_O1  = false;  /* enable IR optimizations */
+    bool verbose  = false;
     /* Preprocessor defines from command line */
     char *pp_defines[64]; int n_pp_defines = 0;
     char *pp_incpaths[64]; int n_pp_incpaths = 0;
@@ -99,6 +106,12 @@ int main(int argc, char **argv) {
             flag_S = true;
         } else if (strcmp(argv[i], "-c") == 0) {
             flag_c = true;
+        } else if (strcmp(argv[i], "-run") == 0) {
+            flag_run = true;
+        } else if (strcmp(argv[i], "-ir") == 0) {
+            flag_ir = true;
+        } else if (strcmp(argv[i], "-O1") == 0 || strcmp(argv[i], "-O2") == 0) {
+            flag_O1 = true;
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -202,6 +215,24 @@ int main(int argc, char **argv) {
     }
     sema_free(sema);
 
+    /* ---- Stage 3c: IR lowering + optimization ---- */
+    IrModule *irmod = NULL;
+    if (flag_ir || flag_O1) {
+        if (verbose) fprintf(stderr, "ccc: lowering IR\n");
+        irmod = ir_module_new();
+        ir_lower(irmod, ast);
+        if (flag_O1) {
+            if (verbose) fprintf(stderr, "ccc: const folding\n");
+            ir_opt_const_fold(irmod);
+            ir_opt_dce(irmod);
+        }
+        if (flag_ir) {
+            fprintf(stderr, "\n=== IR dump ===\n");
+            ir_print(irmod, stderr);
+            fprintf(stderr, "===============\n\n");
+        }
+    }
+
     /* ---- Stage 4: Code generation ---- */
     if (verbose) fprintf(stderr, "ccc: generating code\n");
     CodeGen *cg = codegen_new();
@@ -213,7 +244,18 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Stage 5: Emit ---- */
-    if (flag_S) {
+    if (flag_run) {
+        /* JIT: map code into executable memory and run immediately */
+        if (verbose) fprintf(stderr, "ccc: JIT running\n");
+        int exit_code = codegen_jit_run(cg, verbose);
+        if (irmod) ir_module_free(irmod);
+        codegen_free(cg);
+        parser_free(parser);
+        lexer_free(lexer);
+        free(src);
+        free(default_out);
+        return exit_code;
+    } else if (flag_S) {
         /* Emit assembly */
         FILE *asm_out = stdout;
         if (output_file) {
@@ -265,6 +307,7 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Cleanup ---- */
+    if (irmod) ir_module_free(irmod);
     codegen_free(cg);
     parser_free(parser);
     lexer_free(lexer);

@@ -11,7 +11,8 @@
 /* ---- Code-generator symbol kinds (different from symtable.h SymKind) ---- */
 typedef enum {
     CGSYM_FUNC,
-    CGSYM_OBJECT,    /* .data or .bss */
+    CGSYM_OBJECT,    /* .data (initialized global) */
+    CGSYM_BSS,       /* .bss  (zero-initialized global) */
     CGSYM_RODATA,    /* .rodata (string literals, const data) */
     CGSYM_EXTERN,
 } CGSymKind;
@@ -119,3 +120,11 @@ void codegen_emit_elf(CodeGen *cg, const char *outfile);
  * Useful with -S flag (human-readable output).
  */
 void codegen_emit_asm(CodeGen *cg, FILE *out);
+
+/**
+ * JIT: map code+data into executable memory, resolve relocations via dlsym,
+ * call main(0, NULL) and return its exit code.
+ *
+ * Returns -1 on setup failure, otherwise the return value of main().
+ */
+int codegen_jit_run(CodeGen *cg, bool verbose);

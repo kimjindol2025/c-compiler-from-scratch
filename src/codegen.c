@@ -228,6 +228,7 @@ typedef struct GenCtx {
 
     char      *return_label;
     int        return_type_size;
+    Type      *return_ty;    /* function's return type (for float return convention) */
     const char *func_name;   /* current function name (for static local naming) */
 } GenCtx;
 
@@ -278,6 +279,49 @@ static bool ty_is_unsigned(Type *t) {
         return true;
     default: return false;
     }
+}
+
+/* =========================================================
+ * System V AMD64 ABI struct classification
+ * ========================================================= */
+typedef enum { ABI_INTEGER, ABI_SSE, ABI_MEMORY } AbiClass;
+
+/* Classify one 8-byte chunk of a struct for register passing.
+ * chunk_idx: 0=bytes[0,8), 1=bytes[8,16).
+ * Returns ABI_SSE if all fields in this chunk are float/double,
+ * ABI_INTEGER otherwise, ABI_MEMORY if struct > 16 bytes. */
+static AbiClass classify_struct_chunk(Type *ty, int chunk_idx) {
+    if (!ty) return ABI_INTEGER;
+    int sz = ty->size > 0 ? ty->size : ty_size(ty);
+    if (sz > 16) return ABI_MEMORY;
+
+    int chunk_start = chunk_idx * 8;
+    int chunk_end   = chunk_start + 8;
+
+    bool has_sse = false, has_int = false;
+    for (Member *m = ty->members; m; m = m->next) {
+        int msz   = m->ty ? (m->ty->size > 0 ? m->ty->size : ty_size(m->ty)) : 4;
+        int m_end = m->offset + msz;
+        if (m_end <= chunk_start || m->offset >= chunk_end) continue;
+        if (m->ty && (m->ty->kind == TY_DOUBLE || m->ty->kind == TY_FLOAT))
+            has_sse = true;
+        else
+            has_int = true;
+    }
+    if (has_int) return ABI_INTEGER;
+    if (has_sse) return ABI_SSE;
+    return ABI_INTEGER; /* padding-only chunk */
+}
+
+/* Returns false if struct must go via MEMORY (> 16 bytes).
+ * On success, fills c0 (chunk 0) and c1 (chunk 1, meaningful only if sz>8). */
+static bool classify_struct(Type *ty, AbiClass *c0, AbiClass *c1) {
+    if (!ty || (ty->kind != TY_STRUCT && ty->kind != TY_UNION)) return false;
+    int sz = ty->size > 0 ? ty->size : ty_size(ty);
+    if (sz > 16) return false;
+    *c0 = classify_struct_chunk(ty, 0);
+    *c1 = (sz > 8) ? classify_struct_chunk(ty, 1) : ABI_INTEGER;
+    return true;
 }
 
 /* Load value from [rbp + offset] into rax, sign/zero extending as needed */
@@ -517,10 +561,24 @@ static void gen_compound_assign(GenCtx *ctx, NodeKind op, Node *lhs, Node *rhs) 
 
     enc_pop_r(e, REG_RCX);  /* rcx = lhs value */
 
-    /* Apply op: rax = rcx op rax */
+    /* Apply op: rax = rcx op rax (rcx = old lhs value, rax = rhs) */
     switch (op) {
-    case ND_ASSIGN_ADD: enc_add_rr(e, SZ_64, REG_RCX, REG_RAX); break;
-    case ND_ASSIGN_SUB: enc_sub_rr(e, SZ_64, REG_RCX, REG_RAX); break;
+    case ND_ASSIGN_ADD:
+        /* Pointer arithmetic: scale rhs by element size */
+        if (ty && ty->kind == TY_PTR && ty->base) {
+            int esz = ty_size(ty->base);
+            if (esz > 1) enc_imul_rri(e, SZ_64, REG_RAX, REG_RAX, esz);
+        }
+        enc_add_rr(e, SZ_64, REG_RCX, REG_RAX);
+        break;
+    case ND_ASSIGN_SUB:
+        /* Pointer arithmetic: scale rhs by element size */
+        if (ty && ty->kind == TY_PTR && ty->base) {
+            int esz = ty_size(ty->base);
+            if (esz > 1) enc_imul_rri(e, SZ_64, REG_RAX, REG_RAX, esz);
+        }
+        enc_sub_rr(e, SZ_64, REG_RCX, REG_RAX);
+        break;
     case ND_ASSIGN_MUL: enc_imul_rr(e, SZ_64, REG_RCX, REG_RAX); break;
     case ND_ASSIGN_AND: enc_and_rr(e, SZ_64, REG_RCX, REG_RAX); break;
     case ND_ASSIGN_OR:  enc_or_rr(e, SZ_64, REG_RCX, REG_RAX); break;
@@ -607,10 +665,25 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         enc_mov_ri(e, SZ_64, REG_RAX, n->ival);
         break;
 
-    case ND_FLOAT_LIT:
-        /* Simplified: treat as integer (truncate) */
-        enc_mov_ri(e, SZ_64, REG_RAX, (long long)n->fval);
+    case ND_FLOAT_LIT: {
+        /* Store IEEE754 double in .rodata, load raw bits into RAX */
+        char label[64];
+        snprintf(label, sizeof(label), ".flt%d", ctx->cg->label_count++);
+        double fval = n->fval;
+        uint64_t bits;
+        memcpy(&bits, &fval, 8);
+        size_t off_before = ctx->cg->rodata_buf.size;
+        buf_write64(&ctx->cg->rodata_buf, bits);
+        sym_add(ctx->cg, label, CGSYM_RODATA, off_before, 8, false);
+        /* MOV rax, [rip + rel32]  — 48 8B 05 <rel32> */
+        buf_write8(&e->buf, 0x48);
+        buf_write8(&e->buf, 0x8B);
+        buf_write8(&e->buf, 0x05);
+        size_t reloc_off = enc_size(e);
+        buf_write32(&e->buf, 0);
+        reloc_add(ctx->cg, reloc_off, label, 2 /*R_X86_64_PC32*/, -4);
         break;
+    }
 
     case ND_STR_LIT: {
         /* String literal: put in .rodata, LEA rax, [rip+sym] */
@@ -679,13 +752,21 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         enc_push_r(e, REG_RAX);
         gen_expr(ctx, n->binary.right);
         enc_pop_r(e, REG_RCX);
-        /* If left is pointer, scale right by elem size */
         Type *lty = n->binary.left->type;
-        if (lty && lty->kind == TY_PTR && lty->base) {
-            int esz = ty_size(lty->base);
-            if (esz > 1) enc_imul_rri(e, SZ_64, REG_RAX, REG_RAX, esz);
+        /* Floating-point add */
+        if (lty && type_is_float(lty)) {
+            enc_movq_xmm0_rax(e);   /* xmm0 = right (rax) */
+            enc_movq_xmm1_rcx(e);   /* xmm1 = left (rcx) */
+            enc_addsd(e);            /* xmm0 += xmm1 */
+            enc_movq_rax_xmm0(e);   /* rax = result bits */
+        } else {
+            /* If left is pointer or array, scale right by elem size */
+            if (lty && (lty->kind == TY_PTR || lty->kind == TY_ARRAY) && lty->base) {
+                int esz = ty_size(lty->base);
+                if (esz > 1) enc_imul_rri(e, SZ_64, REG_RAX, REG_RAX, esz);
+            }
+            enc_add_rr(e, SZ_64, REG_RAX, REG_RCX);
         }
-        enc_add_rr(e, SZ_64, REG_RAX, REG_RCX);
         break;
     }
 
@@ -694,40 +775,69 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         enc_push_r(e, REG_RAX);
         gen_expr(ctx, n->binary.right);
         enc_pop_r(e, REG_RCX);
-        /* rcx = left, rax = right; result = left - right = rcx - rax */
-        enc_sub_rr(e, SZ_64, REG_RCX, REG_RAX);
-        enc_mov_rr(e, SZ_64, REG_RAX, REG_RCX);
-        /* Pointer-pointer subtraction: divide by elem size */
+        /* rcx = left, rax = right */
         Type *lty = n->binary.left->type;
-        Type *rty = n->binary.right->type;
-        if (lty && lty->kind == TY_PTR && rty && rty->kind == TY_PTR && lty->base) {
-            int esz = ty_size(lty->base);
-            if (esz > 1) {
-                enc_mov_ri(e, SZ_64, REG_RCX, esz);
-                enc_cqo(e);
-                enc_idiv_r(e, SZ_64, REG_RCX);
+        if (lty && type_is_float(lty)) {
+            /* rcx=left bits, rax=right bits. Want xmm0=left, xmm1=right, subsd */
+            enc_movq_xmm1_rax(e);             /* xmm1 = right (rax) */
+            enc_mov_rr(e, SZ_64, REG_RAX, REG_RCX);  /* rax = left bits */
+            enc_movq_xmm0_rax(e);             /* xmm0 = left */
+            enc_subsd(e);                     /* xmm0 -= xmm1 → left - right */
+            enc_movq_rax_xmm0(e);
+        } else {
+            enc_sub_rr(e, SZ_64, REG_RCX, REG_RAX);
+            enc_mov_rr(e, SZ_64, REG_RAX, REG_RCX);
+            /* Pointer-pointer subtraction: divide by elem size */
+            Type *rty = n->binary.right->type;
+            if (lty && (lty->kind == TY_PTR || lty->kind == TY_ARRAY) &&
+                rty && (rty->kind == TY_PTR || rty->kind == TY_ARRAY) && lty->base) {
+                int esz = ty_size(lty->base);
+                if (esz > 1) {
+                    enc_mov_ri(e, SZ_64, REG_RCX, esz);
+                    enc_cqo(e);
+                    enc_idiv_r(e, SZ_64, REG_RCX);
+                }
             }
         }
         break;
     }
 
-    case ND_MUL:
+    case ND_MUL: {
         gen_expr(ctx, n->binary.left);
         enc_push_r(e, REG_RAX);
         gen_expr(ctx, n->binary.right);
         enc_pop_r(e, REG_RCX);
-        enc_imul_rr(e, SZ_64, REG_RAX, REG_RCX);
+        Type *lty = n->binary.left->type;
+        if (lty && type_is_float(lty)) {
+            enc_movq_xmm0_rax(e);
+            enc_movq_xmm1_rcx(e);
+            enc_mulsd(e);
+            enc_movq_rax_xmm0(e);
+        } else {
+            enc_imul_rr(e, SZ_64, REG_RAX, REG_RCX);
+        }
         break;
+    }
 
-    case ND_DIV:
+    case ND_DIV: {
         gen_expr(ctx, n->binary.left);
         enc_push_r(e, REG_RAX);
         gen_expr(ctx, n->binary.right);
-        enc_mov_rr(e, SZ_64, REG_RCX, REG_RAX);  /* divisor in rcx */
-        enc_pop_r(e, REG_RAX);                    /* dividend in rax */
-        enc_cqo(e);
-        enc_idiv_r(e, SZ_64, REG_RCX);
+        Type *lty = n->binary.left->type;
+        if (lty && type_is_float(lty)) {
+            enc_movq_xmm1_rax(e);   /* xmm1 = right (divisor) */
+            enc_pop_r(e, REG_RAX);  /* rax = left (dividend) */
+            enc_movq_xmm0_rax(e);   /* xmm0 = left */
+            enc_divsd(e);           /* xmm0 /= xmm1 */
+            enc_movq_rax_xmm0(e);
+        } else {
+            enc_mov_rr(e, SZ_64, REG_RCX, REG_RAX);  /* divisor in rcx */
+            enc_pop_r(e, REG_RAX);                    /* dividend in rax */
+            enc_cqo(e);
+            enc_idiv_r(e, SZ_64, REG_RCX);
+        }
         break;
+    }
 
     case ND_MOD:
         gen_expr(ctx, n->binary.left);
@@ -791,21 +901,45 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         enc_push_r(e, REG_RAX);
         gen_expr(ctx, n->binary.right);
         enc_pop_r(e, REG_RCX);
-        enc_cmp_rr(e, SZ_64, REG_RCX, REG_RAX);  /* compare left (rcx) with right (rax) */
-        CondCode cc;
-        switch (n->kind) {
-        case ND_EQ: cc = CC_E;  break;
-        case ND_NE: cc = CC_NE; break;
-        case ND_LT: cc = ty_is_unsigned(n->binary.left->type) ? CC_B  : CC_L;  break;
-        case ND_GT: cc = ty_is_unsigned(n->binary.left->type) ? CC_NBE: CC_G;  break;
-        case ND_LE: cc = ty_is_unsigned(n->binary.left->type) ? CC_BE : CC_LE; break;
-        case ND_GE: cc = ty_is_unsigned(n->binary.left->type) ? CC_AE : CC_GE; break;
-        default:    cc = CC_E;
+        /* rcx = left, rax = right */
+        Type *cmp_ty = n->binary.left->type;
+        if (cmp_ty && type_is_float(cmp_ty)) {
+            /* ucomisd xmm0, xmm1  (xmm0 = left, xmm1 = right)
+               Sets: ZF=1 PF=1 CF=1 if unordered
+                     ZF=1 PF=0 CF=0 if equal
+                     ZF=0 PF=0 CF=1 if left < right
+                     ZF=0 PF=0 CF=0 if left > right */
+            enc_movq_xmm1_rax(e);   /* xmm1 = right */
+            enc_mov_rr(e, SZ_64, REG_RAX, REG_RCX);
+            enc_movq_xmm0_rax(e);   /* xmm0 = left */
+            enc_ucomisd(e);          /* compare xmm0, xmm1 */
+            CondCode cc;
+            switch (n->kind) {
+            case ND_EQ: cc = CC_E;  break;   /* ZF=1, PF=0 */
+            case ND_NE: cc = CC_NE; break;
+            case ND_LT: cc = CC_B;  break;   /* CF=1 */
+            case ND_GT: cc = CC_NBE;break;   /* CF=0, ZF=0 */
+            case ND_LE: cc = CC_BE; break;   /* CF=1 or ZF=1 */
+            case ND_GE: cc = CC_AE; break;   /* CF=0 */
+            default:    cc = CC_E;
+            }
+            enc_setcc(e, cc, REG_RCX);
+            enc_movzx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RCX);
+        } else {
+            enc_cmp_rr(e, SZ_64, REG_RCX, REG_RAX);  /* compare left (rcx) with right (rax) */
+            CondCode cc;
+            switch (n->kind) {
+            case ND_EQ: cc = CC_E;  break;
+            case ND_NE: cc = CC_NE; break;
+            case ND_LT: cc = ty_is_unsigned(cmp_ty) ? CC_B  : CC_L;  break;
+            case ND_GT: cc = ty_is_unsigned(cmp_ty) ? CC_NBE: CC_G;  break;
+            case ND_LE: cc = ty_is_unsigned(cmp_ty) ? CC_BE : CC_LE; break;
+            case ND_GE: cc = ty_is_unsigned(cmp_ty) ? CC_AE : CC_GE; break;
+            default:    cc = CC_E;
+            }
+            enc_setcc(e, cc, REG_RCX);
+            enc_movzx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RCX);
         }
-        /* NOTE: xor must come BEFORE setcc — xor changes flags! */
-        /* Use movzx trick: setcc writes to cl, then movzx rax, cl */
-        enc_setcc(e, cc, REG_RCX);            /* cl = condition (uses CMP flags) */
-        enc_movzx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RCX);  /* rax = (uint64_t)cl */
         break;
     }
 
@@ -985,39 +1119,122 @@ static void gen_expr(GenCtx *ctx, Node *n) {
          * [callee's rbp+16] aligns with the first stack arg (not the pad).
          * Register arg push/pop is net zero.
          */
-        int stack_args = nargs > NARG_REGS ? nargs - NARG_REGS : 0;
-        bool need_align = (stack_args % 2) != 0;
+        /* System V AMD64 ABI: integer args → rdi,rsi,rdx,rcx,r8,r9
+         *                      float/double args → xmm0..xmm7 (independent counter)
+         * Classify args first so we know which register each goes to. */
+        /* === ABI slot classification ===
+         * Each arg may occupy 1 or 2 register slots (structs ≤16 bytes = 2 chunks).
+         * Slot kinds: INT=integer reg, FLT=xmm reg, STK=stack */
+        typedef enum { SLOT_INT, SLOT_FLT, SLOT_STK } SlotKind;
+        typedef struct { int arg_idx; int chunk_off; SlotKind kind; } ArgSlot;
+        ArgSlot slots[64]; int nslots = 0;
+        int int_count = 0, flt_count = 0;
+        { int ic = 0, fc = 0;
+          for (int i = 0; i < nargs && nslots < 62; i++) {
+            Type *aty = n->call.args[i]->type;
+            if (aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION)) {
+                AbiClass c0, c1; bool ok = classify_struct(aty, &c0, &c1);
+                int sz = aty->size > 0 ? aty->size : ty_size(aty);
+                if (!ok || sz > 16) {
+                    /* MEMORY: treat as stack — not ABI-correct but avoids crash */
+                    slots[nslots++] = (ArgSlot){i, 0, SLOT_STK};
+                } else {
+                    /* chunk 0 */
+                    if (c0 == ABI_SSE) {
+                        slots[nslots++] = (ArgSlot){i, 0, (fc < 8) ? SLOT_FLT : SLOT_STK};
+                        if (fc < 8) { fc++; flt_count++; }
+                    } else {
+                        slots[nslots++] = (ArgSlot){i, 0, (ic < NARG_REGS) ? SLOT_INT : SLOT_STK};
+                        if (ic < NARG_REGS) { ic++; int_count++; }
+                    }
+                    /* chunk 1 (only if sz > 8) */
+                    if (sz > 8) {
+                        if (c1 == ABI_SSE) {
+                            slots[nslots++] = (ArgSlot){i, 8, (fc < 8) ? SLOT_FLT : SLOT_STK};
+                            if (fc < 8) { fc++; flt_count++; }
+                        } else {
+                            slots[nslots++] = (ArgSlot){i, 8, (ic < NARG_REGS) ? SLOT_INT : SLOT_STK};
+                            if (ic < NARG_REGS) { ic++; int_count++; }
+                        }
+                    }
+                }
+            } else if (aty && type_is_float(aty)) {
+                slots[nslots++] = (ArgSlot){i, 0, (fc < 8) ? SLOT_FLT : SLOT_STK};
+                if (fc < 8) { fc++; flt_count++; }
+            } else {
+                slots[nslots++] = (ArgSlot){i, 0, (ic < NARG_REGS) ? SLOT_INT : SLOT_STK};
+                if (ic < NARG_REGS) { ic++; int_count++; }
+            }
+          }
+        }
 
-        /* Alignment pad FIRST — goes at the bottom of the stack frame
-         * (high address), so callee's [rbp+16] == first stack arg. */
+        /* Count stack slots and align */
+        int stack_args = 0;
+        for (int k = 0; k < nslots; k++) if (slots[k].kind == SLOT_STK) stack_args++;
+        bool need_align = (stack_args % 2) != 0;
         if (need_align) enc_sub_ri(e, SZ_64, REG_RSP, 8);
 
-        /* Push excess args right-to-left so [RSP] = 7th arg before call */
-        for (int i = nargs - 1; i >= NARG_REGS; i--) {
-            gen_expr(ctx, n->call.args[i]);
-            enc_push_r(e, REG_RAX);
+        /* Push stack slots (right-to-left) */
+        for (int k = nslots - 1; k >= 0; k--) {
+            if (slots[k].kind != SLOT_STK) continue;
+            Type *aty = n->call.args[slots[k].arg_idx]->type;
+            if (aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION)) {
+                gen_lvalue(ctx, n->call.args[slots[k].arg_idx]);
+                enc_mov_rm(e, SZ_64, REG_RCX, REG_RAX, REG_NONE, 1, slots[k].chunk_off);
+                enc_push_r(e, REG_RCX);
+            } else {
+                gen_expr(ctx, n->call.args[slots[k].arg_idx]);
+                enc_push_r(e, REG_RAX);
+            }
         }
 
-        /* Evaluate register args into temporary stack slots (reverse order) */
-        int reg_args = nargs < NARG_REGS ? nargs : NARG_REGS;
-        for (int i = reg_args - 1; i >= 0; i--) {
-            gen_expr(ctx, n->call.args[i]);
-            enc_push_r(e, REG_RAX);
+        /* Push register slots: float first (deepest), then int (on top) */
+        /* We push in reverse order so we can pop in forward order later */
+        { /* Collect float reg slots (in reverse) */
+          for (int k = nslots - 1; k >= 0; k--) {
+            if (slots[k].kind != SLOT_FLT) continue;
+            Type *aty = n->call.args[slots[k].arg_idx]->type;
+            if (aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION)) {
+                gen_lvalue(ctx, n->call.args[slots[k].arg_idx]);
+                enc_mov_rm(e, SZ_64, REG_RCX, REG_RAX, REG_NONE, 1, slots[k].chunk_off);
+                enc_push_r(e, REG_RCX);
+            } else {
+                gen_expr(ctx, n->call.args[slots[k].arg_idx]);
+                enc_push_r(e, REG_RAX);
+            }
+          }
+          /* Collect int reg slots (in reverse, pushed after float → on top) */
+          for (int k = nslots - 1; k >= 0; k--) {
+            if (slots[k].kind != SLOT_INT) continue;
+            Type *aty = n->call.args[slots[k].arg_idx]->type;
+            if (aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION)) {
+                gen_lvalue(ctx, n->call.args[slots[k].arg_idx]);
+                enc_mov_rm(e, SZ_64, REG_RCX, REG_RAX, REG_NONE, 1, slots[k].chunk_off);
+                enc_push_r(e, REG_RCX);
+            } else {
+                gen_expr(ctx, n->call.args[slots[k].arg_idx]);
+                enc_push_r(e, REG_RAX);
+            }
+          }
+          /* Pop int slots into GPRs (top of stack = slot 0) */
+          { int rii = 0;
+            for (int k = 0; k < nslots; k++) {
+                if (slots[k].kind == SLOT_INT) enc_pop_r(e, ARG_REGS[rii++]);
+            }
+          }
+          /* Pop float slots into XMMs */
+          { int xii = 0;
+            for (int k = 0; k < nslots; k++) {
+                if (slots[k].kind == SLOT_FLT) {
+                    enc_pop_r(e, REG_RAX);
+                    enc_movq_xmm_gpr(e, xii++, REG_RAX);
+                }
+            }
+          }
         }
 
-        /* Pop into argument registers */
-        for (int i = 0; i < reg_args; i++) {
-            enc_pop_r(e, ARG_REGS[i]);
-        }
-
-        /* Call the function.
-           For external symbols: emit CALL rel32 placeholder + ELF reloc.
-           We bypass enc_call() to avoid adding to encoder's internal fixup
-           list (which only resolves local labels, not external symbols). */
-        /* Zero AL/RAX before any call — required by System V ABI for variadic
-           functions (AL = number of vector arguments, must be 0 if no SSE args).
-           Safe to do for all calls since we don't track variadic at this point. */
-        enc_xor_rr(e, SZ_32, REG_RAX, REG_RAX);  /* xor eax, eax */
+        /* AL = number of XMM args used (required by System V ABI for variadic) */
+        enc_mov_ri(e, SZ_64, REG_RAX, flt_count > 8 ? 8 : flt_count);
 
         /* Determine if this is a direct call (function name) or indirect
          * (function pointer in a variable).  An ND_VAR/ND_IDENT is a direct
@@ -1050,6 +1267,9 @@ static void gen_expr(GenCtx *ctx, Node *n) {
         if (total_cleanup > 0)
             enc_add_ri(e, SZ_64, REG_RSP, total_cleanup * 8);
 
+        /* If function returns double/float, result is in xmm0 → move to rax */
+        if (n->type && type_is_float(n->type))
+            enc_movq_rax_xmm0(e);
         /* Result is in RAX */
         break;
     }
@@ -1057,30 +1277,42 @@ static void gen_expr(GenCtx *ctx, Node *n) {
     case ND_CAST: {
         /* union field (cast.expr) set by parser; flat field (lhs) set by sema implicit_cast_node */
         Node *cast_inner = n->cast.expr ? n->cast.expr : n->lhs;
+        Type *from = cast_inner ? cast_inner->type : NULL;
         gen_expr(ctx, cast_inner);
-        /* Truncate/extend based on target type */
         Type *to = n->cast.to ? n->cast.to : n->cast_ty;
         if (!to) break;
-        int sz = ty_size(to);
-        if (sz == 1) {
-            /* movsx/movzx al, al (extend byte) */
-            if (ty_is_unsigned(to))
-                enc_movzx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RAX);
-            else
-                enc_movsx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RAX);
-        } else if (sz == 2) {
-            if (ty_is_unsigned(to))
-                enc_movzx_rr(e, SZ_64, SZ_16, REG_RAX, REG_RAX);
-            else
-                enc_movsx_rr(e, SZ_64, SZ_16, REG_RAX, REG_RAX);
-        } else if (sz == 4) {
-            if (ty_is_unsigned(to)) {
-                enc_mov_rr(e, SZ_32, REG_RAX, REG_RAX);  /* zero-extends */
-            } else {
-                enc_movsxd_rr(e, REG_RAX, REG_RAX);
+        bool from_float = from && type_is_float(from);
+        bool to_float   = type_is_float(to);
+        if (from_float && !to_float) {
+            /* double → int: cvttsd2si rax, xmm0 (truncating) */
+            enc_movq_xmm0_rax(e);   /* xmm0 = double bits from rax */
+            enc_cvttsd2si(e);        /* rax = (int64_t)xmm0 */
+        } else if (!from_float && to_float) {
+            /* int → double: cvtsi2sd xmm0, rax; then pack bits back to rax */
+            enc_cvtsi2sd(e);         /* xmm0 = (double)rax */
+            enc_movq_rax_xmm0(e);   /* rax = double bits */
+        } else if (!to_float) {
+            /* int → int truncation/extension */
+            int sz = ty_size(to);
+            if (sz == 1) {
+                if (ty_is_unsigned(to))
+                    enc_movzx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RAX);
+                else
+                    enc_movsx_rr(e, SZ_64, SZ_8, REG_RAX, REG_RAX);
+            } else if (sz == 2) {
+                if (ty_is_unsigned(to))
+                    enc_movzx_rr(e, SZ_64, SZ_16, REG_RAX, REG_RAX);
+                else
+                    enc_movsx_rr(e, SZ_64, SZ_16, REG_RAX, REG_RAX);
+            } else if (sz == 4) {
+                if (ty_is_unsigned(to))
+                    enc_mov_rr(e, SZ_32, REG_RAX, REG_RAX);  /* zero-extends */
+                else
+                    enc_movsxd_rr(e, REG_RAX, REG_RAX);
             }
+            /* 8 bytes: no change */
         }
-        /* For 8 bytes (ptr, long): no truncation needed */
+        /* double → double: no-op */
         break;
     }
 
@@ -1142,6 +1374,53 @@ static void gen_expr(GenCtx *ctx, Node *n) {
 }
 
 /* =========================================================
+ * Recursive init list emission (handles nested arrays/structs)
+ *   il   : ND_INIT_LIST node
+ *   ty   : target type (TY_ARRAY or TY_STRUCT)
+ *   base : RBP-relative base offset of the target object
+ * ========================================================= */
+static void gen_init_list(GenCtx *ctx, Node *il, Type *ty, int base) {
+    Encoder *e = ctx->enc;
+    /* Sync union → flat */
+    if (!il->items && il->init_list.items) {
+        il->items  = il->init_list.items;
+        il->nitems = il->init_list.count;
+    }
+    int count  = il->nitems;
+    Node **its = il->items;
+    if (!its || count == 0) return;
+
+    if (ty && ty->kind == TY_STRUCT) {
+        Member *m = ty->members;
+        for (int i = 0; i < count && m; i++, m = m->next) {
+            Node *item = its[i];
+            if (item->kind == ND_INIT_LIST)
+                gen_init_list(ctx, item, m->ty, base + m->offset);
+            else {
+                gen_expr(ctx, item);
+                enc_mov_mr(e, ty_opsize(m->ty),
+                           REG_RBP, REG_NONE, 1, base + m->offset, REG_RAX);
+            }
+        }
+    } else {
+        /* Array (possibly multidimensional) */
+        Type *elem = ty ? ty->base : NULL;
+        int   esz  = elem && elem->size > 0 ? elem->size : 8;
+        for (int i = 0; i < count; i++) {
+            Node *item = its[i];
+            int   off  = base + i * esz;
+            if (item->kind == ND_INIT_LIST)
+                gen_init_list(ctx, item, elem, off);
+            else {
+                gen_expr(ctx, item);
+                enc_mov_mr(e, ty_opsize(elem),
+                           REG_RBP, REG_NONE, 1, off, REG_RAX);
+            }
+        }
+    }
+}
+
+/* =========================================================
  * Statement code generation
  * ========================================================= */
 
@@ -1164,8 +1443,9 @@ static void gen_stmt(GenCtx *ctx, Node *n) {
         break;
 
     case ND_VAR_DECL: {
-        /* Allocate local variable */
-        Type *ty = n->decl.decl_type;
+        /* Prefer sema-resolved type from decl_var (has correct member offsets) */
+        Type *ty = (n->decl_var && n->decl_var->ty) ? n->decl_var->ty
+                                                     : n->decl.decl_type;
         int sz = ty ? ty_size(ty) : 8;
         if (sz <= 0) sz = 8;
 
@@ -1183,15 +1463,7 @@ static void gen_stmt(GenCtx *ctx, Node *n) {
         /* Initialize */
         if (n->decl.init) {
             if (n->decl.init->kind == ND_INIT_LIST) {
-                /* Array/struct initializer */
-                int elem_sz = ty && ty->base ? ty_size(ty->base) : 8;
-                for (int i = 0; i < n->decl.init->init_list.count; i++) {
-                    gen_expr(ctx, n->decl.init->init_list.items[i]);
-                    /* Store at offset + i * elem_sz */
-                    enc_mov_mr(e, ty_opsize(ty ? ty->base : NULL),
-                               REG_RBP, REG_NONE, 1,
-                               offset + i * elem_sz, REG_RAX);
-                }
+                gen_init_list(ctx, n->decl.init, ty, offset);
             } else {
                 gen_expr(ctx, n->decl.init);
                 store_local(ctx, offset, ty);
@@ -1482,6 +1754,8 @@ static void gen_function(CodeGen *cg, Node *fn) {
     char ret_label[64];
     snprintf(ret_label, sizeof(ret_label), ".%s_ret", fname);
     ctx.return_label = ret_label;
+    /* Store return type for double-return convention */
+    ctx.return_ty = (fn->func_ty && fn->func_ty->return_ty) ? fn->func_ty->return_ty : NULL;
 
     /* Bind parameters to local variables */
     int nparams = fn->func.param_count;
@@ -1521,33 +1795,61 @@ static void gen_function(CodeGen *cg, Node *fn) {
         /* Reserve the save area so local_alloc doesn't overlap it */
         ctx.locals.next_offset = -(NARG_REGS * 8);
     } else {
-        for (int i = 0; i < nparams && i < NARG_REGS; i++) {
-            Node *param = fn->func.params[i];
-            Type *pty   = param->param.param_type;
-            if (!pty) {
-                /* default to int */
-                pty = calloc(1, sizeof(Type));
-                pty->kind = TY_INT; pty->size = 4; pty->align = 4;
-            }
-            int off = local_alloc(&ctx.locals, param->param.name, pty);
-            /* Store arg register to local */
-            OpSize opsz = ty_opsize(pty);
-            enc_mov_mr(e, opsz, REG_RBP, REG_NONE, 1, off, ARG_REGS[i]);
-        }
-        /* Stack parameters (i >= 6) are at [rbp + 16 + (i-6)*8] */
-        for (int i = NARG_REGS; i < nparams; i++) {
+        /* System V AMD64 ABI: int params in GPRs, float params in XMMs */
+        int int_pi = 0, flt_pi = 0;
+        for (int i = 0; i < nparams; i++) {
             Node *param = fn->func.params[i];
             Type *pty   = param->param.param_type;
             if (!pty) {
                 pty = calloc(1, sizeof(Type));
                 pty->kind = TY_INT; pty->size = 4; pty->align = 4;
             }
-            LocalVar *v = calloc(1, sizeof(LocalVar));
-            v->name   = strdup(param->param.name);
-            v->offset = 16 + (i - NARG_REGS) * 8;  /* positive from rbp */
-            v->type   = pty;
-            v->next   = ctx.locals.vars;
-            ctx.locals.vars = v;
+            if (pty && (pty->kind == TY_STRUCT || pty->kind == TY_UNION)) {
+                /* Struct param: receive chunks per ABI classification */
+                AbiClass c0, c1;
+                int sz = pty->size > 0 ? pty->size : ty_size(pty);
+                int off = local_alloc(&ctx.locals, param->param.name, pty);
+                if (sz <= 16 && classify_struct(pty, &c0, &c1)) {
+                    /* chunk 0 */
+                    if (c0 == ABI_SSE && flt_pi < 8) {
+                        enc_movq_gpr_xmm(e, REG_RCX, flt_pi++);
+                    } else if (c0 == ABI_INTEGER && int_pi < NARG_REGS) {
+                        enc_mov_rr(e, SZ_64, REG_RCX, ARG_REGS[int_pi++]);
+                    } else { enc_mov_ri(e, SZ_64, REG_RCX, 0); } /* spill: not yet impl */
+                    enc_mov_mr(e, SZ_64, REG_RBP, REG_NONE, 1, off, REG_RCX);
+                    /* chunk 1 (only if struct > 8 bytes) */
+                    if (sz > 8) {
+                        if (c1 == ABI_SSE && flt_pi < 8) {
+                            enc_movq_gpr_xmm(e, REG_RCX, flt_pi++);
+                        } else if (c1 == ABI_INTEGER && int_pi < NARG_REGS) {
+                            enc_mov_rr(e, SZ_64, REG_RCX, ARG_REGS[int_pi++]);
+                        } else { enc_mov_ri(e, SZ_64, REG_RCX, 0); }
+                        enc_mov_mr(e, SZ_64, REG_RBP, REG_NONE, 1, off + 8, REG_RCX);
+                    }
+                }
+            } else if (pty && type_is_float(pty) && flt_pi < 8) {
+                /* Float param: received in xmm{flt_pi}, store bit pattern via RAX */
+                int off = local_alloc(&ctx.locals, param->param.name, pty);
+                enc_movq_gpr_xmm(e, REG_RAX, flt_pi++);
+                enc_mov_mr(e, SZ_64, REG_RBP, REG_NONE, 1, off, REG_RAX);
+            } else if (!(pty && type_is_float(pty)) && int_pi < NARG_REGS) {
+                /* Integer param: received in ARG_REGS[int_pi] */
+                int off = local_alloc(&ctx.locals, param->param.name, pty);
+                OpSize opsz = ty_opsize(pty);
+                enc_mov_mr(e, opsz, REG_RBP, REG_NONE, 1, off, ARG_REGS[int_pi++]);
+            } else {
+                /* Stack param */
+                int stack_idx = (int_pi >= NARG_REGS) ? (int_pi - NARG_REGS) :
+                                (flt_pi >= 8) ? (flt_pi - 8) : 0;
+                LocalVar *v = calloc(1, sizeof(LocalVar));
+                v->name   = strdup(param->param.name);
+                v->offset = 16 + stack_idx * 8;
+                v->type   = pty;
+                v->next   = ctx.locals.vars;
+                ctx.locals.vars = v;
+                if (pty && type_is_float(pty)) flt_pi++;
+                else int_pi++;
+            }
         }
     }
 
@@ -1556,6 +1858,11 @@ static void gen_function(CodeGen *cg, Node *fn) {
 
     /* Return label */
     enc_label(e, ret_label);
+
+    /* If function returns double/float, move bit pattern from rax → xmm0
+     * (System V ABI: floating-point return value goes in xmm0) */
+    if (ctx.return_ty && type_is_float(ctx.return_ty))
+        enc_movq_xmm0_rax(e);
 
     /* Restore callee-saved registers */
     enc_pop_r(e, REG_R15);
@@ -1661,7 +1968,7 @@ static void gen_global(CodeGen *cg, Node *decl) {
         size_t off = cg->bss_size;
         size_t pad = (align - (off % align)) % align;
         cg->bss_size += pad + sz;
-        sym_add(cg, name, CGSYM_OBJECT, off + pad, sz, !decl->decl.is_static);
+        sym_add(cg, name, CGSYM_BSS, off + pad, sz, !decl->decl.is_static);
     } else {
         /* .data — evaluate constant initializer */
         /* For simplicity: only handle integer literals */
@@ -1804,6 +2111,183 @@ void codegen_emit_asm(CodeGen *cg, FILE *out) {
     /* .bss */
     if (cg->bss_size > 0) {
         fprintf(out, "\n\t.bss\n");
-        fprintf(out, "\t.zero\t%zu\n", cg->bss_size);
+        for (SymEntry *s = cg->syms; s; s = s->next) {
+            if (s->kind != CGSYM_BSS) continue;
+            if (s->is_global) fprintf(out, "\t.globl\t%s\n", s->name);
+            fprintf(out, "\t.align\t%d\n", s->size <= 4 ? 4 : 8);
+            fprintf(out, "%s:\n\t.zero\t%d\n", s->name, s->size);
+        }
     }
+}
+
+/* =========================================================
+ * JIT execution
+ *
+ * Strategy:
+ *   1. mmap two regions: code (PROT_EXEC) + data (PROT_READ|PROT_WRITE)
+ *   2. Copy .text bytes into code region
+ *   3. Copy .rodata + .data bytes into data region; bss follows zeroed
+ *   4. Resolve relocations:
+ *       R_X86_64_PC32 (type 2): sym_addr - patch_addr - 4
+ *       R_X86_64_64  (type 1): absolute sym_addr + addend
+ *   5. mprotect code region to PROT_READ|PROT_EXEC
+ *   6. Find main's offset, cast to fn ptr, call.
+ * ========================================================= */
+/* Need _GNU_SOURCE for MAP_ANONYMOUS and RTLD_DEFAULT on Linux */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sys/mman.h>
+#include <dlfcn.h>
+
+int codegen_jit_run(CodeGen *cg, bool verbose) {
+    if (!cg) return -1;
+
+    /* Pre-load common libraries so dlsym can find math/c functions */
+    dlopen("libm.so.6",   RTLD_GLOBAL | RTLD_LAZY);
+    dlopen("libc.so.6",   RTLD_GLOBAL | RTLD_LAZY);
+
+    size_t text_sz   = enc_size(cg->enc);
+    size_t rodata_sz = cg->rodata_buf.size;
+    size_t data_sz   = cg->data_buf.size;
+    size_t bss_sz    = cg->bss_size;
+
+    if (text_sz == 0) {
+        fprintf(stderr, "jit: no code generated\n");
+        return -1;
+    }
+
+    /* --- Allocate code region (RW first, then flip to RX) --- */
+    size_t code_region = text_sz + 4096; /* extra for safety */
+    code_region = (code_region + 4095) & ~(size_t)4095;
+    uint8_t *code = mmap(NULL, code_region,
+                         PROT_READ | PROT_WRITE,
+                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (code == MAP_FAILED) { perror("jit: mmap code"); return -1; }
+
+    /* --- Allocate data region: rodata + data + bss --- */
+    size_t data_region = rodata_sz + data_sz + bss_sz + 4096;
+    data_region = (data_region + 4095) & ~(size_t)4095;
+    uint8_t *data_mem = mmap(NULL, data_region,
+                             PROT_READ | PROT_WRITE,
+                             MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (data_mem == MAP_FAILED) { munmap(code, code_region); perror("jit: mmap data"); return -1; }
+
+    /* Copy sections */
+    memcpy(code, cg->enc->buf.data, text_sz);
+    uint8_t *rodata_start = data_mem;
+    uint8_t *data_start   = data_mem + rodata_sz;
+    uint8_t *bss_start    = data_start + data_sz;
+    if (rodata_sz) memcpy(rodata_start, cg->rodata_buf.data, rodata_sz);
+    if (data_sz)   memcpy(data_start,   cg->data_buf.data,   data_sz);
+    /* bss is already zero (mmap zeroes anonymous pages) */
+
+    if (verbose) {
+        fprintf(stderr, "jit: code@%p (%zu bytes)\n", (void*)code, text_sz);
+        fprintf(stderr, "jit: data@%p (ro=%zu d=%zu bss=%zu)\n",
+                (void*)data_mem, rodata_sz, data_sz, bss_sz);
+    }
+
+    /* --- Build symbol → address map --- */
+    /* Patch each relocation */
+    for (Reloc *r = cg->relocs; r; r = r->next) {
+        /* Find target address */
+        uint8_t *target = NULL;
+
+        /* 1. Check our own symbols (functions, globals) */
+        for (SymEntry *s = cg->syms; s; s = s->next) {
+            if (strcmp(s->name, r->sym_name) == 0) {
+                switch (s->kind) {
+                case CGSYM_FUNC:
+                    target = code + s->offset;
+                    break;
+                case CGSYM_OBJECT:
+                    target = data_start + s->offset;
+                    break;
+                case CGSYM_BSS:
+                    target = bss_start + s->offset;
+                    break;
+                case CGSYM_RODATA:
+                    target = rodata_start + s->offset;
+                    break;
+                default:
+                    break;
+                }
+                break;
+            }
+        }
+
+        /* 2. Check data entries (string literals etc.) */
+        if (!target) {
+            size_t off = 0;
+            for (DataEntry *de = cg->data_entries; de; de = de->next) {
+                if (de->label && strcmp(de->label, r->sym_name) == 0) {
+                    target = de->is_rodata ? (rodata_start + off)
+                                           : (data_start + off);
+                    break;
+                }
+                off += de->size;
+            }
+        }
+
+        /* 3. External symbol: resolve via dlsym */
+        if (!target) {
+            target = (uint8_t *)dlsym(RTLD_DEFAULT, r->sym_name);
+            if (!target) {
+                if (verbose)
+                    fprintf(stderr, "jit: unresolved symbol '%s'\n", r->sym_name);
+                /* Leave unpatched — may crash, but let it proceed */
+                continue;
+            }
+        }
+
+        uint8_t *patch_site = code + r->offset;
+        if (r->type == 2 || r->type == 4) {
+            /* R_X86_64_PC32 (2) / R_X86_64_PLT32 (4): 32-bit PC-relative
+             * ELF formula: displaced = S + A - P
+             *   S = target, A = addend, P = patch_site (address of 4-byte field) */
+            int64_t rel = (int64_t)target + r->addend - (int64_t)patch_site;
+            int32_t rel32 = (int32_t)rel;
+            memcpy(patch_site, &rel32, 4);
+        } else if (r->type == 1) {
+            /* R_X86_64_64: 64-bit absolute */
+            int64_t abs = (int64_t)target + r->addend;
+            memcpy(patch_site, &abs, 8);
+        } else if (r->type == 10) {
+            /* R_X86_64_32S: 32-bit signed absolute */
+            int32_t abs32 = (int32_t)((int64_t)target + r->addend);
+            memcpy(patch_site, &abs32, 4);
+        }
+    }
+
+    /* Flip code to executable */
+    if (mprotect(code, code_region, PROT_READ | PROT_EXEC) != 0) {
+        perror("jit: mprotect"); munmap(code, code_region);
+        munmap(data_mem, data_region); return -1;
+    }
+
+    /* Find main */
+    uint8_t *main_ptr = NULL;
+    for (SymEntry *s = cg->syms; s; s = s->next) {
+        if (strcmp(s->name, "main") == 0 && s->kind == CGSYM_FUNC) {
+            main_ptr = code + s->offset;
+            break;
+        }
+    }
+    if (!main_ptr) {
+        fprintf(stderr, "jit: 'main' not found\n");
+        munmap(code, code_region); munmap(data_mem, data_region);
+        return -1;
+    }
+
+    if (verbose) fprintf(stderr, "jit: calling main@%p\n", (void*)main_ptr);
+
+    /* Call main(0, NULL) */
+    typedef int (*main_fn_t)(int, char**);
+    main_fn_t fn = (main_fn_t)(void*)main_ptr;
+    int ret = fn(0, NULL);
+
+    munmap(code, code_region);
+    munmap(data_mem, data_region);
+    return ret;
 }

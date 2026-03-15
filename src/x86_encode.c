@@ -810,3 +810,183 @@ void enc_cdqe(Encoder *e){ buf_write8(&e->buf, 0x48); buf_write8(&e->buf, 0x98);
 void enc_nop(Encoder *e)     { buf_write8(&e->buf, 0x90); }
 void enc_int3(Encoder *e)    { buf_write8(&e->buf, 0xCC); }
 void enc_syscall(Encoder *e) { buf_write8(&e->buf, 0x0F); buf_write8(&e->buf, 0x05); }
+
+/* =========================================================
+ * SSE2 double-precision scalar instructions
+ *
+ * Convention: xmm_dst / xmm_src are register numbers 0-7.
+ * RBP-relative memory operands: mod=10, rm=5 (4-byte disp).
+ * ========================================================= */
+
+/* Helper: emit F2 0F <op> xmm_reg, [rbp+off32] */
+static void sse2_xmm_rbp(Encoder *e, uint8_t op, int xmm_reg, int off) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, op);
+    /* ModRM: mod=10 (disp32), reg=xmm_reg, rm=5 (rbp) */
+    buf_write8(&e->buf, (uint8_t)(0x85 | ((xmm_reg & 7) << 3)));
+    buf_write32(&e->buf, (uint32_t)(int32_t)off);
+}
+
+/* movsd xmm_dst, [rbp+off] */
+void enc_movsd_load(Encoder *e, int xmm_dst, int off) {
+    sse2_xmm_rbp(e, 0x10, xmm_dst, off);
+}
+
+/* movsd [rbp+off], xmm_src */
+void enc_movsd_store(Encoder *e, int off, int xmm_src) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x11);  /* MOVSD m64, xmm */
+    buf_write8(&e->buf, (uint8_t)(0x85 | ((xmm_src & 7) << 3)));
+    buf_write32(&e->buf, (uint32_t)(int32_t)off);
+}
+
+/* movsd xmm_dst, xmm_src */
+void enc_movsd_rr(Encoder *e, int xmm_dst, int xmm_src) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x10);
+    /* ModRM: mod=11, reg=xmm_dst, rm=xmm_src */
+    buf_write8(&e->buf, (uint8_t)(0xC0 | ((xmm_dst & 7) << 3) | (xmm_src & 7)));
+}
+
+/* Helper: emit F2 0F <op> xmm0, xmm1 (binop xmm0 op= xmm1) */
+static void sse2_binop(Encoder *e, uint8_t op) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, op);
+    buf_write8(&e->buf, 0xC1);  /* ModRM: mod=11, reg=xmm0, rm=xmm1 */
+}
+
+void enc_addsd(Encoder *e) { sse2_binop(e, 0x58); }  /* xmm0 += xmm1 */
+void enc_subsd(Encoder *e) { sse2_binop(e, 0x5C); }  /* xmm0 -= xmm1 */
+void enc_mulsd(Encoder *e) { sse2_binop(e, 0x59); }  /* xmm0 *= xmm1 */
+void enc_divsd(Encoder *e) { sse2_binop(e, 0x5E); }  /* xmm0 /= xmm1 */
+
+/* ucomisd xmm0, xmm1 — sets ZF/PF/CF for comparisons */
+void enc_ucomisd(Encoder *e) {
+    buf_write8(&e->buf, 0x66);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x2E);
+    buf_write8(&e->buf, 0xC1);  /* ModRM: mod=11, reg=xmm0, rm=xmm1 */
+}
+
+/* cvttsd2si rax, xmm0 — truncating double → int64 */
+void enc_cvttsd2si(Encoder *e) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x48);  /* REX.W */
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x2C);
+    buf_write8(&e->buf, 0xC0);  /* ModRM: mod=11, reg=rax(0), rm=xmm0(0) */
+}
+
+/* cvtsi2sd xmm0, rax — int64 → double */
+void enc_cvtsi2sd(Encoder *e) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x48);  /* REX.W */
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x2A);
+    buf_write8(&e->buf, 0xC0);  /* ModRM: mod=11, reg=xmm0(0), rm=rax(0) */
+}
+
+/* movsd xmm0, [rip + disp32]  — for loading doubles from .rodata
+ * Returns the offset of the 4-byte displacement field (for relocation). */
+size_t enc_movsd_rip(Encoder *e) {
+    buf_write8(&e->buf, 0xF2);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x10);
+    buf_write8(&e->buf, 0x05);  /* ModRM: mod=00, reg=xmm0, rm=5 (RIP-relative) */
+    size_t disp_off = enc_size(e);
+    buf_write32(&e->buf, 0);    /* placeholder */
+    return disp_off;
+}
+
+/* sub rsp, 8; movsd [rsp], xmm0  — push xmm0 onto stack */
+void enc_push_xmm0(Encoder *e) {
+    buf_write8(&e->buf, 0x48); buf_write8(&e->buf, 0x83);
+    buf_write8(&e->buf, 0xEC); buf_write8(&e->buf, 0x08);  /* sub rsp, 8 */
+    buf_write8(&e->buf, 0xF2); buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x11); buf_write8(&e->buf, 0x04);
+    buf_write8(&e->buf, 0x24);  /* movsd [rsp], xmm0 */
+}
+
+/* movsd xmm1, [rsp]; add rsp, 8  — pop stack into xmm1 */
+void enc_pop_xmm1(Encoder *e) {
+    buf_write8(&e->buf, 0xF2); buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x10); buf_write8(&e->buf, 0x0C);
+    buf_write8(&e->buf, 0x24);  /* movsd xmm1, [rsp] */
+    buf_write8(&e->buf, 0x48); buf_write8(&e->buf, 0x83);
+    buf_write8(&e->buf, 0xC4); buf_write8(&e->buf, 0x08);  /* add rsp, 8 */
+}
+
+/* ── MOVQ: transfer bit-pattern between XMM and integer registers ── */
+
+/* movq xmm0, rax  (GPR→XMM, preserves bit pattern; same as movq via PEXTRQ/PINSRQ but simpler) */
+/* Encoding: 66 REX.W 0F 6E /r   ModRM=C0 (mod=11, reg=xmm0(0), rm=rax(0)) */
+void enc_movq_xmm0_rax(Encoder *e) {
+    buf_write8(&e->buf, 0x66);
+    buf_write8(&e->buf, 0x48);  /* REX.W */
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x6E);
+    buf_write8(&e->buf, 0xC0);
+}
+
+/* movq xmm1, rax  (GPR→XMM for right operand) */
+/* ModRM=C8: mod=11, reg=xmm1(1), rm=rax(0) */
+void enc_movq_xmm1_rax(Encoder *e) {
+    buf_write8(&e->buf, 0x66);
+    buf_write8(&e->buf, 0x48);  /* REX.W */
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x6E);
+    buf_write8(&e->buf, 0xC8);
+}
+
+/* movq rax, xmm0  (XMM→GPR, preserves bit pattern) */
+/* Encoding: 66 REX.W 0F 7E /r   ModRM=C0 (mod=11, reg=xmm0(0), rm=rax(0)) */
+void enc_movq_rax_xmm0(Encoder *e) {
+    buf_write8(&e->buf, 0x66);
+    buf_write8(&e->buf, 0x48);  /* REX.W */
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x7E);
+    buf_write8(&e->buf, 0xC0);
+}
+
+/* movq xmm1, rcx  (GPR→XMM for left operand stored in rcx after pop) */
+/* ModRM=C9: mod=11, reg=xmm1(1), rm=rcx(1) */
+void enc_movq_xmm1_rcx(Encoder *e) {
+    buf_write8(&e->buf, 0x66);
+    buf_write8(&e->buf, 0x48);  /* REX.W */
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x6E);
+    buf_write8(&e->buf, 0xC9);
+}
+
+/* movq xmmN, src_gpr  (GPR→XMM for argument N)
+ * Encoding: 66 REX.W [REX.R if xmm>=8] 0F 6E /r
+ * xmm 0-7 only for now (REX.R not needed) */
+void enc_movq_xmm_gpr(Encoder *e, int xmm_dst, Reg src) {
+    buf_write8(&e->buf, 0x66);
+    uint8_t rex = 0x48;  /* REX.W */
+    if ((int)src >= 8) rex |= 0x01;    /* REX.B for extended src */
+    if (xmm_dst >= 8)  rex |= 0x04;   /* REX.R for extended xmm */
+    buf_write8(&e->buf, rex);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x6E);
+    uint8_t modrm = (uint8_t)(0xC0 | ((xmm_dst & 7) << 3) | ((int)src & 7));
+    buf_write8(&e->buf, modrm);
+}
+
+/* movq dst_gpr, xmmN  (XMM→GPR)
+ * Encoding: 66 REX.W [REX.R] 0F 7E /r */
+void enc_movq_gpr_xmm(Encoder *e, Reg dst, int xmm_src) {
+    buf_write8(&e->buf, 0x66);
+    uint8_t rex = 0x48;  /* REX.W */
+    if ((int)dst >= 8) rex |= 0x01;
+    if (xmm_src >= 8)  rex |= 0x04;
+    buf_write8(&e->buf, rex);
+    buf_write8(&e->buf, 0x0F);
+    buf_write8(&e->buf, 0x7E);
+    uint8_t modrm = (uint8_t)(0xC0 | ((xmm_src & 7) << 3) | ((int)dst & 7));
+    buf_write8(&e->buf, modrm);
+}

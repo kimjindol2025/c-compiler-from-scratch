@@ -546,7 +546,8 @@ static Type *parse_declarator_suffix(Parser *p, Type *ty) {
             /* Function declarator */
             advance_tok(p); /* '(' */
             Type *func_ty = alloc_type(p, TY_FUNC);
-            func_ty->base = ty; /* return type */
+            func_ty->base      = ty; /* return type */
+            func_ty->return_ty = ty; /* alias — must be set for resolve_type(TY_FUNC) */
             func_ty->size  = 8; /* function pointer size */
             func_ty->align = 8;
 
@@ -858,6 +859,9 @@ static bool is_type_start(Parser *p) {
     case TK_UNSIGNED: case TK_BOOL: case TK_STRUCT: case TK_UNION:
     case TK_ENUM: case TK_CONST: case TK_VOLATILE: case TK_RESTRICT:
     case TK_ATOMIC: case TK_COMPLEX:
+    /* storage-class specifiers also start a declaration */
+    case TK_STATIC: case TK_EXTERN: case TK_AUTO: case TK_REGISTER:
+    case TK_INLINE: case TK_TYPEDEF:
         return true;
     case TK_IDENT:
         return is_typedef_name(p, t.sval ? t.sval : "");
@@ -1167,8 +1171,18 @@ static Node *parse_compound_stmt(Parser *p) {
             stmt = parse_stmt(p);
         }
         if (stmt) {
-            node_array_push(p->arena, &n->compound.stmts,
-                            &n->compound.count, &n->compound.cap, stmt);
+            /* Flatten synthetic multi-decl compounds into the parent block
+             * so they share the parent scope (not a new sub-scope).
+             * A synthetic compound has flat stmts==NULL (parser didn't sync it). */
+            if (stmt->kind == ND_COMPOUND && !stmt->stmts && stmt->compound.stmts) {
+                for (int si = 0; si < stmt->compound.count; si++)
+                    node_array_push(p->arena, &n->compound.stmts,
+                                    &n->compound.count, &n->compound.cap,
+                                    stmt->compound.stmts[si]);
+            } else {
+                node_array_push(p->arena, &n->compound.stmts,
+                                &n->compound.count, &n->compound.cap, stmt);
+            }
         }
     }
 

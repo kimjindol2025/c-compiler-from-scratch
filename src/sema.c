@@ -161,8 +161,19 @@ static Type *resolve_type(Sema *s, Type *ty)
     case TY_LONG:  case TY_ULONG:
     case TY_LLONG: case TY_ULLONG:
     case TY_FLOAT: case TY_DOUBLE: case TY_LDOUBLE:
-    case TY_ENUM:
         return ty;
+
+    case TY_ENUM: {
+        /* Register enum constants into symbol table (idempotent: skip if done) */
+        for (EnumConst *ec = ty->enumerators; ec; ec = ec->next) {
+            if (!ec->name) continue;
+            Symbol *existing = symtable_lookup(s->symtable, ec->name);
+            if (existing && existing->kind == SYM_ENUM_CONST) continue;
+            Symbol *sym = symtable_define(s->symtable, SYM_ENUM_CONST, ec->name, ty_int);
+            if (sym) sym->enum_val = ec->value;
+        }
+        return ty;
+    }
 
     case TY_TYPEDEF_REF: {
         /* Look up the typedef name */
@@ -301,6 +312,10 @@ static void process_var_decl(Sema *s, Node *node)
 
     /* Analyse initialiser expression */
     if (node->decl_init) {
+        /* For init lists, propagate the variable's type as context so the
+         * handler can resolve struct member types / array element types. */
+        if (node->decl_init->kind == ND_INIT_LIST && !node->decl_init->ty)
+            node->decl_init->ty = v->ty;
         Type *init_ty = analyze_expr(s, node->decl_init);
         if (init_ty && !sema_is_assignable(s, v->ty, init_ty)) {
             char tbuf[64], ibuf[64];
@@ -369,6 +384,16 @@ static void analyze_func_def(Sema *s, Node *node)
     Type *ft = node->func_ty ? node->func_ty : ty_int;
     ft = resolve_type(s, ft);
     node->func_ty = ft;
+
+    /* Propagate resolved param types back to param AST nodes.
+     * resolve_type updates ft->params[] but not the param node's param_type field,
+     * which codegen reads for type-size info (e.g., struct layout). */
+    if (ft->kind == TY_FUNC && ft->params) {
+        for (int i = 0; i < ft->param_count && i < node->func.param_count; i++) {
+            if (ft->params[i])
+                node->func.params[i]->param.param_type = ft->params[i];
+        }
+    }
 
     /* Register/update function symbol at file scope */
     Symbol *fsym = symtable_lookup_current(s->symtable, node->fname);
@@ -462,6 +487,11 @@ static void analyze_stmt(Sema *s, Node *node)
 
     /* --- Compound statement --- */
     case ND_BLOCK: {
+        /* Sync union → flat: parser writes compound.* fields */
+        if (!node->stmts && node->compound.stmts) {
+            node->stmts  = node->compound.stmts;
+            node->nstmts = node->compound.count;
+        }
         symtable_push_scope(s->symtable, 0);
         for (int i = 0; i < node->nstmts; i++)
             analyze_stmt(s, node->stmts[i]);
@@ -695,6 +725,7 @@ static Node *implicit_cast_node(Node *expr, Type *to)
     cast->lhs      = expr;     /* flat field */
     cast->cast.expr = expr;    /* union field */
     cast->ty       = to;
+    cast->type     = to;   /* keep both aliases in sync */
     return cast;
 }
 
@@ -741,6 +772,7 @@ static Type *analyze_expr(Sema *s, Node *node)
     }
 
     /* --- Variable reference --- */
+    case ND_IDENT: /* Parser generates ND_IDENT for variable references; treat same as ND_VAR */
     case ND_VAR: {
         Var *v = node->var;
         if (!v) {
@@ -1152,9 +1184,34 @@ static Type *analyze_expr(Sema *s, Node *node)
 
     /* --- Initializer list --- */
     case ND_INIT_LIST: {
-        for (int i = 0; i < node->nitems; i++)
-            analyze_expr(s, node->items[i]);
-        return set_ty(node, ty_void); /* type set later by context */
+        /* Sync union → flat (parser fills init_list.*) */
+        if (!node->items && node->init_list.items) {
+            node->items  = node->init_list.items;
+            node->nitems = node->init_list.count;
+        }
+
+        Type *ctx_ty = node->ty; /* pre-set by process_var_decl if available */
+
+        if (ctx_ty && ctx_ty->kind == TY_STRUCT) {
+            /* Struct initializer: analyze each item against the member type */
+            Member *m = ctx_ty->members;
+            for (int i = 0; i < node->nitems && m; i++, m = m->next) {
+                if (node->items[i]->kind == ND_INIT_LIST)
+                    node->items[i]->ty = m->ty; /* propagate member type */
+                analyze_expr(s, node->items[i]);
+            }
+            return set_ty(node, ctx_ty);
+        } else if (ctx_ty && ctx_ty->kind == TY_ARRAY && ctx_ty->base) {
+            /* Array initializer: analyze each item against element type */
+            for (int i = 0; i < node->nitems; i++)
+                analyze_expr(s, node->items[i]);
+            return set_ty(node, ctx_ty);
+        } else {
+            /* Unknown context — just type-check items */
+            for (int i = 0; i < node->nitems; i++)
+                analyze_expr(s, node->items[i]);
+            return ctx_ty ? set_ty(node, ctx_ty) : set_ty(node, ty_void);
+        }
     }
 
     default:
