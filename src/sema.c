@@ -227,14 +227,16 @@ static Type *resolve_type(Sema *s, Type *ty)
             }
         }
         /* Resolve member types and recompute layout.
-         * The parser may have computed offsets using incomplete member types
-         * (e.g., struct A's size was 0 when struct B was parsed).  Always
-         * re-lay-out once we have complete member information.            */
-        if (ty->members) {
-            /* Temporarily clear is_complete to allow relayout */
-            ty->is_complete = false;
+         * Guard: 자기 참조 구조체(struct Node { struct Node *next; })에서
+         * resolve_type이 무한 재귀에 빠지지 않도록 is_resolving 플래그 사용.
+         * 포인터 멤버는 크기가 8바이트로 확정되므로 불완전 base 타입도 무방하다. */
+        /* is_complete: 이미 레이아웃 완료 → 재진입 불필요
+         * is_resolving: 현재 멤버 순회 중 → 재귀 진입 금지 (자기참조 구조체) */
+        if (ty->members && !ty->is_resolving && !ty->is_complete) {
+            ty->is_resolving = true;
             for (Member *m = ty->members; m; m = m->next)
                 m->ty = resolve_type(s, m->ty);
+            ty->is_resolving = false;
             type_layout_struct(ty);   /* sets is_complete = true */
         }
         return ty;
@@ -1164,7 +1166,8 @@ static Type *analyze_expr(Sema *s, Node *node)
                 node->member_name ? node->member_name : "?");
             return set_ty(node, ty_int);
         }
-        Type *struct_ty = pd->base;
+        /* ND_MEMBER처럼 re-resolve: 자기참조 포인터의 base가 forward ref일 수 있음 */
+        Type *struct_ty = resolve_type(s, pd->base);
         for (Member *m = struct_ty->members; m; m = m->next) {
             if (m->name && node->member_name &&
                 strcmp(m->name, node->member_name) == 0) {

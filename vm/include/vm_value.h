@@ -157,6 +157,15 @@ typedef struct {
     int      n_ic_slots;
     /* 소스 위치 (예외 스택 트레이스용) */
     int     *line_numbers; /* code[i]의 소스 줄 번호 */
+
+    /* ── Specializing Adaptive Interpreter (SAI) ─────────────────
+     * 각 바이트코드 위치의 특수화 카운트다운.
+     * 최초 NULL → 지연 할당 (code_cap 크기).
+     * counter[pos] 가 0에 도달하면:
+     *   → 관찰된 타입에 맞는 특수화 opcode로 code[pos] 교체.
+     * guard 실패 시: 다시 generic opcode로 복원.
+     */
+    uint8_t *spec_counters;
 } ObjFunc;
 
 /* ObjClosure: 함수 + 캡처된 환경

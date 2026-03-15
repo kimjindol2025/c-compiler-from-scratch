@@ -59,6 +59,16 @@ const char *opcode_names[OP_COUNT] = {
     [OP_SET_FIELD]        = "SET_FIELD",
     [OP_PRINT]            = "PRINT",
     [OP_HALT]             = "HALT",
+    /* SAI fast path */
+    [OP_ADD_INT]          = "ADD_INT",
+    [OP_ADD_FLOAT]        = "ADD_FLOAT",
+    [OP_SUB_INT]          = "SUB_INT",
+    [OP_MUL_INT]          = "MUL_INT",
+    [OP_LT_INT]           = "LT_INT",
+    [OP_LE_INT]           = "LE_INT",
+    [OP_GT_INT]           = "GT_INT",
+    [OP_GE_INT]           = "GE_INT",
+    [OP_EQ_INT]           = "EQ_INT",
 };
 
 /* ── 바이트코드 방출 ───────────────────────────────────── */

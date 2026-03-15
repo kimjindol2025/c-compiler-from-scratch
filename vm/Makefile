@@ -13,7 +13,7 @@ OBJ = $(SRC:.c=.o)
 
 LIB = libvm.a
 
-all: $(LIB) tests/test_vm tests/test_native
+all: $(LIB) tests/test_vm tests/test_native tests/test_specialize
 
 $(LIB): $(OBJ)
 	ar rcs $@ $^
@@ -24,6 +24,9 @@ tests/test_vm: tests/test_vm.c $(LIB)
 tests/test_native: tests/test_native.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< -L. $(LIB) $(LDFLAGS)
 
+tests/test_specialize: tests/test_specialize.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< -L. $(LIB) $(LDFLAGS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -31,6 +34,6 @@ test: tests/test_vm
 	./tests/test_vm
 
 clean:
-	rm -f $(OBJ) $(LIB) tests/test_vm
+	rm -f $(OBJ) $(LIB) tests/test_vm tests/test_native tests/test_specialize
 
 .PHONY: all test clean

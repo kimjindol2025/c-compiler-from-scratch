@@ -132,6 +132,32 @@ typedef enum {
     OP_PRINT,         /* 디버그 출력 */
     OP_HALT,          /* VM 종료 */
 
+    /* ── Specializing Adaptive Interpreter (SAI) ─────────────
+     *
+     * 이 opcodes는 컴파일러가 절대 생성하지 않는다.
+     * VM 자신이 실행 중 타입 프로파일을 관찰한 뒤,
+     * 바이트코드 배열을 in-place로 덮어써서 교체한다.
+     *
+     * 동작 원리:
+     *   1. 범용 OP_ADD가 실행될 때마다 spec_counter 감소
+     *   2. counter == 0 이 되면 관찰된 타입 확인
+     *   3. 항상 int+int이었다면 → code[pos] = OP_ADD_INT로 교체
+     *   4. 이후 OP_ADD_INT: 타입 체크 없음 (guard만 있음)
+     *   5. guard 실패 (타입이 바뀜) → OP_ADD로 복원 (despecialize)
+     *
+     * 이것이 "정적 컴파일러가 절대 할 수 없는 것"이다:
+     *   코드가 실행될수록 코드 자체가 빠르게 변한다.
+     */
+    OP_ADD_INT,    /* int + int  (guard 포함, 타입 체크 없음) */
+    OP_ADD_FLOAT,  /* float + float */
+    OP_SUB_INT,    /* int - int */
+    OP_MUL_INT,    /* int * int */
+    OP_LT_INT,     /* int < int */
+    OP_LE_INT,     /* int <= int */
+    OP_GT_INT,     /* int > int */
+    OP_GE_INT,     /* int >= int */
+    OP_EQ_INT,     /* int == int */
+
     OP_COUNT          /* 총 opcode 수 */
 } OpCode;
 

@@ -177,6 +177,7 @@ static void sweep(VM *vm) {
                 free(fn->constants);
                 free(fn->line_numbers);
                 free(fn->ic_slots);
+                free(fn->spec_counters);  /* SAI: lazy 할당된 카운터 배열 해제 */
                 free(fn);
                 break;
             }

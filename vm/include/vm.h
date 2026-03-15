@@ -104,6 +104,15 @@ typedef struct {
     ObjClosure *closure;       /* catch_ip가 속한 클로저 */
 } TryFrame;
 
+/* ── SAI 설정 & 통계 ──────────────────────────────────────────── */
+#define SPEC_THRESHOLD 16   /* 이 횟수 실행 후 타입 관찰 → 특수화 */
+
+typedef struct {
+    uint64_t specializations;    /* generic → specialized 교체 횟수 */
+    uint64_t despecializations;  /* guard 실패 → generic 복원 횟수 */
+    uint64_t spec_hits;          /* fast path (특수화 opcode) 실행 횟수 */
+} VMStats;
+
 /* ================================================================
  * Q3: GC / 메모리 소유권 모델은 어떻게 작동하는가?
  *
@@ -125,6 +134,9 @@ typedef struct {
  * ================================================================ */
 
 typedef struct VM {
+    /* ── SAI 통계 ───────────────────────────────────────── */
+    VMStats stats;
+
     /* ── 실행 상태 ─────────────────────────────────────── */
     Value      value_stack[STACK_MAX];
     int        stack_top;              /* 다음 push 위치 (= 현재 크기) */
@@ -287,3 +299,6 @@ void vm_define_native(VM *vm, const char *name, NativeFn fn, int arity);
 
 /* 기본 내장 함수 등록 (vm 초기화 후 한 번 호출) */
 void vm_register_builtins(VM *vm);
+
+/* SAI 통계 출력 */
+void vm_print_stats(VM *vm);

@@ -197,6 +197,7 @@ struct Type {
     bool        is_restrict;
     bool        is_atomic;
     bool        is_complete;
+    bool        is_resolving; /* 재귀 guard: resolve_type 중복 진입 방지 */
 
     /* TY_PTR   → pointee
        TY_ARRAY → element

@@ -27,6 +27,52 @@ void      vm_close_upvals(VM *vm, Value *slot);
 #define POP()      vm_pop(vm)
 #define PEEK(d)    vm_peek(vm, d)
 
+/* ── Specializing Adaptive Interpreter (SAI) 매크로 ──────────────
+ *
+ * SPEC_THRESHOLD: 이 횟수만큼 실행 후 타입 프로파일 보고 특수화
+ * SAI_SPECIALIZE: 현재 ip-1 위치의 opcode를 new_op로 교체
+ * SAI_DESPECIALIZE: guard 실패 → generic opcode 복원
+ * SAI_PROBE: spec_counters를 초기화하고 카운트다운; 0이면 true 반환
+ *
+ * ip-1: READ_BYTE()가 이미 ip를 전진시켰으므로, 현재 opcode 위치.
+ */
+#define SAI_SPECIALIZE(fn, new_op) do {                           \
+    int _p = (int)((ip - 1) - (fn)->code);                       \
+    if (_p >= 0 && _p < (fn)->code_len) {                        \
+        (fn)->code[_p] = (uint8_t)(new_op);                      \
+        vm->stats.specializations++;                              \
+    }                                                             \
+} while(0)
+
+#define SAI_DESPECIALIZE(fn, generic_op) do {                    \
+    int _p = (int)((ip - 1) - (fn)->code);                       \
+    if (_p >= 0 && _p < (fn)->code_len) {                        \
+        (fn)->code[_p] = (uint8_t)(generic_op);                  \
+        if ((fn)->spec_counters) (fn)->spec_counters[_p] = SPEC_THRESHOLD; \
+        vm->stats.despecializations++;                            \
+    }                                                             \
+} while(0)
+
+/* spec_counters 지연 초기화 + 카운트다운. 0에 도달하면 true. */
+#define SAI_COUNTDOWN(fn) __extension__({                        \
+    bool _fire = false;                                           \
+    if ((fn)->code_cap > 0) {                                     \
+        if (!(fn)->spec_counters) {                               \
+            (fn)->spec_counters = malloc((fn)->code_cap);         \
+            if ((fn)->spec_counters)                              \
+                memset((fn)->spec_counters, SPEC_THRESHOLD,       \
+                       (fn)->code_cap);                           \
+        }                                                         \
+        int _p = (int)((ip - 1) - (fn)->code);                   \
+        if ((fn)->spec_counters && _p >= 0 && _p < (fn)->code_len) { \
+            if ((fn)->spec_counters[_p] > 0)                     \
+                (fn)->spec_counters[_p]--;                        \
+            _fire = ((fn)->spec_counters[_p] == 0);              \
+        }                                                         \
+    }                                                             \
+    _fire;                                                        \
+})
+
 #define READ_BYTE()  (*ip++)
 #define READ_U16()   (ip += 2, (uint16_t)(ip[-2] | (ip[-1] << 8)))
 #define READ_I32()   (ip += 4, (int32_t)((uint32_t)(ip[-4] | (ip[-3]<<8) | (ip[-2]<<16) | (ip[-1]<<24))))
@@ -39,6 +85,20 @@ void      vm_close_upvals(VM *vm, Value *slot);
     fprintf(stderr, "RuntimeError: " fmt "\n", ##__VA_ARGS__);       \
     goto error;                                                       \
 } while (0)
+
+/* SAI 통계 출력 ────────────────────────────────────────── */
+void vm_print_stats(VM *vm) {
+    printf("=== SAI Stats ===\n");
+    printf("  specializations  : %llu\n", (unsigned long long)vm->stats.specializations);
+    printf("  despecializations: %llu\n", (unsigned long long)vm->stats.despecializations);
+    printf("  spec_hits        : %llu\n", (unsigned long long)vm->stats.spec_hits);
+    if (vm->stats.specializations > 0) {
+        double hit_rate = (double)vm->stats.spec_hits /
+                          (vm->stats.spec_hits + vm->stats.despecializations +
+                           vm->stats.specializations) * 100.0;
+        printf("  fast path rate   : %.1f%%\n", hit_rate);
+    }
+}
 
 /* VM 초기화 / 해제 ────────────────────────────────────── */
 
@@ -181,8 +241,106 @@ VMResult vm_run(VM *vm, ObjClosure *entry) {
     /* ip를 로컬 변수로 캐시 (매번 frame->ip 접근보다 빠름) */
     register uint8_t *ip = frame->ip;
 
-    /* ─ 디스패치 루프 ─────────────────────────────────── */
+    /* ─ Computed Goto 디스패치 테이블 ─────────────────────
+     *
+     * 왜 Computed Goto인가?
+     *
+     * Switch 방식:
+     *   모든 DISPATCH() → 중앙 'dispatch:' 레이블 → switch
+     *   → CPU 분기 예측기가 하나의 점프 지점을 공유
+     *   → fib(n-1)의 OP_ADD가 fib(n-2)의 OP_ADD와 경쟁
+     *
+     * Computed Goto 방식:
+     *   각 DISPATCH() → 직접 다음 opcode 핸들러로 점프
+     *   → CPU가 "이 위치에서 다음에는 OP_SUB가 올 것"을 독립적으로 예측
+     *   → 분기 예측기가 호출 위치마다 개별화됨 (per-callsite prediction)
+     *
+     * 효과: 분기 예측 미스 감소 → 파이프라인 스톨 감소
+     * SAI + Computed Goto = 시너지:
+     *   OP_ADD_INT가 dispatch_table에 직접 있으므로
+     *   타입 체크도 없고 중앙 switch도 없음.
+     */
+#ifdef __GNUC__
+    static const void *_dt[OP_COUNT] = {
+        [0 ... OP_COUNT-1]        = &&lbl_UNKNOWN,
+        [OP_LOAD_CONST]           = &&lbl_LOAD_CONST,
+        [OP_LOAD_NIL]             = &&lbl_LOAD_NIL,
+        [OP_LOAD_TRUE]            = &&lbl_LOAD_TRUE,
+        [OP_LOAD_FALSE]           = &&lbl_LOAD_FALSE,
+        [OP_LOAD_LOCAL]           = &&lbl_LOAD_LOCAL,
+        [OP_STORE_LOCAL]          = &&lbl_STORE_LOCAL,
+        [OP_LOAD_GLOBAL]          = &&lbl_LOAD_GLOBAL,
+        [OP_STORE_GLOBAL]         = &&lbl_STORE_GLOBAL,
+        [OP_LOAD_UPVAL]           = &&lbl_LOAD_UPVAL,
+        [OP_STORE_UPVAL]          = &&lbl_STORE_UPVAL,
+        [OP_CLOSE_UPVAL]          = &&lbl_CLOSE_UPVAL,
+        [OP_POP]                  = &&lbl_POP,
+        [OP_DUP]                  = &&lbl_DUP,
+        [OP_SWAP]                 = &&lbl_SWAP,
+        [OP_ADD]                  = &&lbl_ADD,
+        [OP_SUB]                  = &&lbl_SUB,
+        [OP_MUL]                  = &&lbl_MUL,
+        [OP_DIV]                  = &&lbl_DIV,
+        [OP_MOD]                  = &&lbl_MOD,
+        [OP_NEG]                  = &&lbl_NEG,
+        [OP_POW]                  = &&lbl_POW,
+        [OP_EQ]                   = &&lbl_EQ,
+        [OP_NE]                   = &&lbl_NE,
+        [OP_LT]                   = &&lbl_LT,
+        [OP_LE]                   = &&lbl_LE,
+        [OP_GT]                   = &&lbl_GT,
+        [OP_GE]                   = &&lbl_GE,
+        [OP_NOT]                  = &&lbl_NOT,
+        [OP_AND]                  = &&lbl_AND,
+        [OP_OR]                   = &&lbl_OR,
+        [OP_JUMP]                 = &&lbl_JUMP,
+        [OP_JUMP_IF_FALSE]        = &&lbl_JUMP_IF_FALSE,
+        [OP_JUMP_IF_TRUE]         = &&lbl_JUMP_IF_TRUE,
+        [OP_POP_JUMP_IF_FALSE]    = &&lbl_POP_JUMP_IF_FALSE,
+        [OP_POP_JUMP_IF_TRUE]     = &&lbl_POP_JUMP_IF_TRUE,
+        [OP_CALL]                 = &&lbl_CALL,
+        [OP_CALL_METHOD]          = &&lbl_CALL_METHOD,
+        [OP_RETURN]               = &&lbl_RETURN,
+        [OP_RETURN_NIL]           = &&lbl_RETURN_NIL,
+        [OP_MAKE_CLOSURE]         = &&lbl_MAKE_CLOSURE,
+        [OP_TRY_BEGIN]            = &&lbl_TRY_BEGIN,
+        [OP_TRY_END]              = &&lbl_TRY_END,
+        [OP_THROW]                = &&lbl_THROW,
+        [OP_RETHROW]              = &&lbl_RETHROW,
+        [OP_MAKE_ARRAY]           = &&lbl_MAKE_ARRAY,
+        [OP_ARRAY_GET]            = &&lbl_ARRAY_GET,
+        [OP_ARRAY_SET]            = &&lbl_ARRAY_SET,
+        [OP_ARRAY_LEN]            = &&lbl_ARRAY_LEN,
+        [OP_GET_FIELD]            = &&lbl_GET_FIELD,
+        [OP_SET_FIELD]            = &&lbl_SET_FIELD,
+        [OP_PRINT]                = &&lbl_PRINT,
+        [OP_HALT]                 = &&lbl_HALT,
+        [OP_ADD_INT]              = &&lbl_ADD_INT,
+        [OP_ADD_FLOAT]            = &&lbl_ADD_FLOAT,
+        [OP_SUB_INT]              = &&lbl_SUB_INT,
+        [OP_MUL_INT]              = &&lbl_MUL_INT,
+        [OP_LT_INT]               = &&lbl_LT_INT,
+        [OP_LE_INT]               = &&lbl_LE_INT,
+        [OP_GT_INT]               = &&lbl_GT_INT,
+        [OP_GE_INT]               = &&lbl_GE_INT,
+        [OP_EQ_INT]               = &&lbl_EQ_INT,
+    };
+    const uint8_t *_code_end = frame->closure->func->code +
+                                frame->closure->func->code_len;
+    #define UPDATE_FRAME() (_code_end = frame->closure->func->code + \
+                                        frame->closure->func->code_len)
+    #undef DISPATCH
+    #define DISPATCH() do { \
+        if (__builtin_expect(ip >= _code_end, 0)) goto halt; \
+        goto *_dt[*ip++]; \
+    } while(0)
+#else
+    #define UPDATE_FRAME() ((void)0)
 #define DISPATCH() goto dispatch
+#endif
+    /* 초기 dispatch: GCC에서는 computed goto 테이블로 직접 진입 */
+    DISPATCH();
+
 dispatch:;
     if (!ip || ip >= frame->closure->func->code + frame->closure->func->code_len)
         goto halt;
@@ -191,35 +349,35 @@ dispatch:;
     switch ((OpCode)op) {
 
     /* ── 상수 로드 ──────────────────────────────────── */
-    case OP_LOAD_CONST: {
+    lbl_LOAD_CONST: case OP_LOAD_CONST: {
         uint16_t idx = READ_U16();
         PUSH(frame->closure->func->constants[idx]);
         DISPATCH();
     }
-    case OP_LOAD_NIL:   PUSH(val_nil());        DISPATCH();
-    case OP_LOAD_TRUE:  PUSH(val_bool(true));   DISPATCH();
-    case OP_LOAD_FALSE: PUSH(val_bool(false));  DISPATCH();
+    lbl_LOAD_NIL: case OP_LOAD_NIL:   PUSH(val_nil());        DISPATCH();
+    lbl_LOAD_TRUE: case OP_LOAD_TRUE:  PUSH(val_bool(true));   DISPATCH();
+    lbl_LOAD_FALSE: case OP_LOAD_FALSE: PUSH(val_bool(false));  DISPATCH();
 
     /* ── 로컬 변수 ──────────────────────────────────── */
-    case OP_LOAD_LOCAL: {
+    lbl_LOAD_LOCAL: case OP_LOAD_LOCAL: {
         uint8_t idx = READ_BYTE();
         PUSH(SLOT(idx));
         DISPATCH();
     }
-    case OP_STORE_LOCAL: {
+    lbl_STORE_LOCAL: case OP_STORE_LOCAL: {
         uint8_t idx = READ_BYTE();
         SLOT(idx) = PEEK(0); /* pop하지 않음: 대입식 자체가 값 */
         DISPATCH();
     }
 
     /* ── 전역 변수 ──────────────────────────────────── */
-    case OP_LOAD_GLOBAL: {
+    lbl_LOAD_GLOBAL: case OP_LOAD_GLOBAL: {
         uint16_t idx = READ_U16();
         if (idx >= (uint16_t)vm->global_count) RUNTIME_ERR("global index out of range");
         PUSH(vm->global_values[idx]);
         DISPATCH();
     }
-    case OP_STORE_GLOBAL: {
+    lbl_STORE_GLOBAL: case OP_STORE_GLOBAL: {
         uint16_t idx = READ_U16();
         if (idx >= (uint16_t)vm->global_count) RUNTIME_ERR("global index out of range");
         vm->global_values[idx] = PEEK(0);
@@ -231,52 +389,84 @@ dispatch:;
      * open: 스택 슬롯 직접 접근
      * closed: upval 내부 복사본 접근
      */
-    case OP_LOAD_UPVAL: {
+    lbl_LOAD_UPVAL: case OP_LOAD_UPVAL: {
         uint8_t idx = READ_BYTE();
         PUSH(*frame->closure->upvalues[idx]->location);
         DISPATCH();
     }
-    case OP_STORE_UPVAL: {
+    lbl_STORE_UPVAL: case OP_STORE_UPVAL: {
         uint8_t idx = READ_BYTE();
         *frame->closure->upvalues[idx]->location = PEEK(0);
         DISPATCH();
     }
-    case OP_CLOSE_UPVAL:
+    lbl_CLOSE_UPVAL: case OP_CLOSE_UPVAL:
         /* 현재 스택 top 슬롯을 close → closed 상태로 전환 */
         vm_close_upvals(vm, &vm->value_stack[vm->stack_top - 1]);
         POP();
         DISPATCH();
 
     /* ── 스택 조작 ──────────────────────────────────── */
-    case OP_POP:  POP();                                DISPATCH();
-    case OP_DUP:  PUSH(PEEK(0));                        DISPATCH();
-    case OP_SWAP: {
+    lbl_POP: case OP_POP:  POP();                                DISPATCH();
+    lbl_DUP: case OP_DUP:  PUSH(PEEK(0));                        DISPATCH();
+    lbl_SWAP: case OP_SWAP: {
         Value t = PEEK(0);
         vm->value_stack[vm->stack_top - 1] = PEEK(1);
         vm->value_stack[vm->stack_top - 2] = t;
         DISPATCH();
     }
 
-    /* ── 산술 ───────────────────────────────────────── */
-    case OP_ADD: { Value b=POP(), a=POP(); PUSH(arith_add(a,b)); DISPATCH(); }
-    case OP_SUB: { Value b=POP(), a=POP(); PUSH(arith_sub(a,b)); DISPATCH(); }
-    case OP_MUL: { Value b=POP(), a=POP(); PUSH(arith_mul(a,b)); DISPATCH(); }
-    case OP_DIV: { Value b=POP(), a=POP(); PUSH(arith_div(a,b)); DISPATCH(); }
-    case OP_MOD: {
+    /* ── 산술 (generic) ─────────────────────────────────
+     * 각 opcode는 실행 횟수를 세다가 SPEC_THRESHOLD에 도달하면
+     * 관찰된 타입에 맞는 fast opcode로 자신을 교체한다.
+     */
+    lbl_ADD: case OP_ADD: {
+        Value b=POP(), a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn)) {
+            if (a.kind == VAL_INT   && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_ADD_INT);
+            else if (a.kind == VAL_FLOAT && b.kind == VAL_FLOAT)
+                SAI_SPECIALIZE(fn, OP_ADD_FLOAT);
+        }
+        PUSH(arith_add(a,b));
+        DISPATCH();
+    }
+    lbl_SUB: case OP_SUB: {
+        Value b=POP(), a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn)) {
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_SUB_INT);
+        }
+        PUSH(arith_sub(a,b));
+        DISPATCH();
+    }
+    lbl_MUL: case OP_MUL: {
+        Value b=POP(), a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn)) {
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_MUL_INT);
+        }
+        PUSH(arith_mul(a,b));
+        DISPATCH();
+    }
+    lbl_DIV: case OP_DIV: { Value b=POP(), a=POP(); PUSH(arith_div(a,b)); DISPATCH(); }
+    lbl_MOD: case OP_MOD: {
         Value b=POP(), a=POP();
         if (a.kind==VAL_INT && b.kind==VAL_INT && b.i!=0)
             PUSH(val_int(a.i % b.i));
         else RUNTIME_ERR("mod requires integers");
         DISPATCH();
     }
-    case OP_NEG: {
+    lbl_NEG: case OP_NEG: {
         Value a = POP();
         if (a.kind == VAL_INT)   PUSH(val_int(-a.i));
         else if (a.kind == VAL_FLOAT) PUSH(val_float(-a.f));
         else RUNTIME_ERR("neg requires number");
         DISPATCH();
     }
-    case OP_POW: {
+    lbl_POW: case OP_POW: {
         Value b=POP(), a=POP();
         double fa = (a.kind==VAL_INT) ? (double)a.i : a.f;
         double fb = (b.kind==VAL_INT) ? (double)b.i : b.f;
@@ -296,43 +486,107 @@ dispatch:;
     PUSH(val_bool(res)); \
 } while(0)
 
-    case OP_EQ: { Value b=POP(),a=POP(); PUSH(val_bool(val_equal(a,b))); DISPATCH(); }
-    case OP_NE: { Value b=POP(),a=POP(); PUSH(val_bool(!val_equal(a,b))); DISPATCH(); }
-    case OP_LT: CMP_OP(<);  DISPATCH();
-    case OP_LE: CMP_OP(<=); DISPATCH();
-    case OP_GT: CMP_OP(>);  DISPATCH();
-    case OP_GE: CMP_OP(>=); DISPATCH();
+    lbl_EQ: case OP_EQ: {
+        Value b=POP(),a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn))
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_EQ_INT);
+        PUSH(val_bool(val_equal(a,b)));
+        DISPATCH();
+    }
+    lbl_NE: case OP_NE: { Value b=POP(),a=POP(); PUSH(val_bool(!val_equal(a,b))); DISPATCH(); }
+    lbl_LT: case OP_LT: {
+        Value b=POP(),a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn))
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_LT_INT);
+        bool res;
+        if (a.kind==VAL_INT && b.kind==VAL_INT)         res = a.i < b.i;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT)  res = a.f < b.f;
+        else if (a.kind==VAL_INT&&b.kind==VAL_FLOAT)    res = (double)a.i < b.f;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_INT)    res = a.f < (double)b.i;
+        else res = false;
+        PUSH(val_bool(res));
+        DISPATCH();
+    }
+    lbl_LE: case OP_LE: {
+        Value b=POP(),a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn))
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_LE_INT);
+        bool res;
+        if (a.kind==VAL_INT && b.kind==VAL_INT)         res = a.i <= b.i;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT)  res = a.f <= b.f;
+        else if (a.kind==VAL_INT&&b.kind==VAL_FLOAT)    res = (double)a.i <= b.f;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_INT)    res = a.f <= (double)b.i;
+        else res = false;
+        PUSH(val_bool(res));
+        DISPATCH();
+    }
+    lbl_GT: case OP_GT: {
+        Value b=POP(),a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn))
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_GT_INT);
+        bool res;
+        if (a.kind==VAL_INT && b.kind==VAL_INT)         res = a.i > b.i;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT)  res = a.f > b.f;
+        else if (a.kind==VAL_INT&&b.kind==VAL_FLOAT)    res = (double)a.i > b.f;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_INT)    res = a.f > (double)b.i;
+        else res = false;
+        PUSH(val_bool(res));
+        DISPATCH();
+    }
+    lbl_GE: case OP_GE: {
+        Value b=POP(),a=POP();
+        ObjFunc *fn = frame->closure->func;
+        if (SAI_COUNTDOWN(fn))
+            if (a.kind == VAL_INT && b.kind == VAL_INT)
+                SAI_SPECIALIZE(fn, OP_GE_INT);
+        bool res;
+        if (a.kind==VAL_INT && b.kind==VAL_INT)         res = a.i >= b.i;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT)  res = a.f >= b.f;
+        else if (a.kind==VAL_INT&&b.kind==VAL_FLOAT)    res = (double)a.i >= b.f;
+        else if (a.kind==VAL_FLOAT&&b.kind==VAL_INT)    res = a.f >= (double)b.i;
+        else res = false;
+        PUSH(val_bool(res));
+        DISPATCH();
+    }
 
     /* ── 논리 ───────────────────────────────────────── */
-    case OP_NOT: { Value a=POP(); PUSH(val_bool(!val_truthy(a))); DISPATCH(); }
-    case OP_AND: {
+    lbl_NOT: case OP_NOT: { Value a=POP(); PUSH(val_bool(!val_truthy(a))); DISPATCH(); }
+    lbl_AND: case OP_AND: {
         /* short-circuit: falsy면 top 유지 (JUMP가 처리) */
         DISPATCH();
     }
-    case OP_OR: { DISPATCH(); }
+    lbl_OR: case OP_OR: { DISPATCH(); }
 
     /* ── 분기 ───────────────────────────────────────── */
-    case OP_JUMP: {
+    lbl_JUMP: case OP_JUMP: {
         int32_t off = READ_I32();
         ip += off;
         DISPATCH();
     }
-    case OP_JUMP_IF_FALSE: {
+    lbl_JUMP_IF_FALSE: case OP_JUMP_IF_FALSE: {
         int32_t off = READ_I32();
         if (!val_truthy(PEEK(0))) ip += off;
         DISPATCH();
     }
-    case OP_JUMP_IF_TRUE: {
+    lbl_JUMP_IF_TRUE: case OP_JUMP_IF_TRUE: {
         int32_t off = READ_I32();
         if (val_truthy(PEEK(0))) ip += off;
         DISPATCH();
     }
-    case OP_POP_JUMP_IF_FALSE: {
+    lbl_POP_JUMP_IF_FALSE: case OP_POP_JUMP_IF_FALSE: {
         int32_t off = READ_I32();
         if (!val_truthy(POP())) ip += off;
         DISPATCH();
     }
-    case OP_POP_JUMP_IF_TRUE: {
+    lbl_POP_JUMP_IF_TRUE: case OP_POP_JUMP_IF_TRUE: {
         int32_t off = READ_I32();
         if (val_truthy(POP())) ip += off;
         DISPATCH();
@@ -346,7 +600,7 @@ dispatch:;
      * 호출 후 frame.slots: 위 배열에서 closure 바로 뒤 = [arg0] ...
      *   → slots[0]=arg0, slots[1]=arg1, ...이 자연스럽게 맞아떨어짐
      */
-    case OP_CALL: {
+    lbl_CALL: case OP_CALL: {
         uint8_t  nargs   = READ_BYTE();
         uint16_t ic_slot = READ_U16();
         (void)ic_slot;
@@ -396,6 +650,7 @@ dispatch:;
 
         frame = new_frame;
         ip    = frame->ip;
+        UPDATE_FRAME();  /* computed goto: _code_end 갱신 */
 
         /* 로컬 변수 슬롯 예약 (인수 제외한 나머지) */
         int extra = cl->func->max_locals - nargs;
@@ -408,7 +663,7 @@ dispatch:;
      * Q1: 프레임 팝 + 스택 복원
      * Q6: 반환 전에 이 프레임의 upvalue 닫기
      */
-    case OP_RETURN: {
+    lbl_RETURN: case OP_RETURN: {
         Value ret = POP();
 
         /* Q6: 이 프레임의 모든 로컬을 가리키는 open upvalue close */
@@ -432,10 +687,11 @@ dispatch:;
         /* 이전 프레임 복원 */
         frame = &vm->frame_stack[vm->frame_count - 1];
         ip    = frame->ip;
+        UPDATE_FRAME();  /* computed goto: _code_end 갱신 */
         DISPATCH();
     }
 
-    case OP_RETURN_NIL: {
+    lbl_RETURN_NIL: case OP_RETURN_NIL: {
         vm_close_upvals(vm, frame->slots);
         vm->frame_count--;
         if (vm->frame_count == 0) {
@@ -447,6 +703,7 @@ dispatch:;
         PUSH(val_nil());
         frame = &vm->frame_stack[vm->frame_count - 1];
         ip    = frame->ip;
+        UPDATE_FRAME();  /* computed goto: _code_end 갱신 */
         DISPATCH();
     }
 
@@ -459,7 +716,7 @@ dispatch:;
      * is_local=1: 현재 프레임의 슬롯을 캡처 (새 ObjUpval 또는 재사용)
      * is_local=0: 현재 클로저의 upvalue를 전달 (중첩 클로저)
      */
-    case OP_MAKE_CLOSURE: {
+    lbl_MAKE_CLOSURE: case OP_MAKE_CLOSURE: {
         uint16_t func_idx = READ_U16();
         uint8_t  n_upvals = READ_BYTE();
 
@@ -489,7 +746,7 @@ dispatch:;
     /* ── 예외 처리 ──────────────────────────────────────
      * Q5: TryFrame 기반 스택 언와인딩
      */
-    case OP_TRY_BEGIN: {
+    lbl_TRY_BEGIN: case OP_TRY_BEGIN: {
         int32_t catch_off   = READ_I32();
         int32_t finally_off = READ_I32();
 
@@ -504,11 +761,11 @@ dispatch:;
         DISPATCH();
     }
 
-    case OP_TRY_END:
+    lbl_TRY_END: case OP_TRY_END:
         if (vm->try_top > 0) vm->try_top--;
         DISPATCH();
 
-    case OP_THROW: {
+    lbl_THROW: case OP_THROW: {
         Value exc = POP();
 
         if (vm->try_top == 0) {
@@ -540,11 +797,12 @@ dispatch:;
         frame = &vm->frame_stack[vm->frame_count - 1];
         ip    = tf->catch_ip ? tf->catch_ip
                              : tf->finally_ip;
+        UPDATE_FRAME();
         if (!ip) goto error;
         DISPATCH();
     }
 
-    case OP_RETHROW: {
+    lbl_RETHROW: case OP_RETHROW: {
         Value exc = POP();
         /* 같은 위치에서 다시 THROW처럼 처리 */
         PUSH(exc);
@@ -553,7 +811,7 @@ dispatch:;
     }
 
     /* ── 배열 ───────────────────────────────────────── */
-    case OP_MAKE_ARRAY: {
+    lbl_MAKE_ARRAY: case OP_MAKE_ARRAY: {
         uint16_t n = READ_U16();
         ObjArray *arr = vm_alloc_array(vm, n);
         arr->len = n;
@@ -564,7 +822,7 @@ dispatch:;
         PUSH(val_obj((Obj*)arr));
         DISPATCH();
     }
-    case OP_ARRAY_GET: {
+    lbl_ARRAY_GET: case OP_ARRAY_GET: {
         Value idx_v = POP();
         Value arr_v = POP();
         if (!val_is_obj_kind(arr_v, OBJ_ARRAY)) RUNTIME_ERR("not an array");
@@ -574,7 +832,7 @@ dispatch:;
         PUSH(arr->data[idx]);
         DISPATCH();
     }
-    case OP_ARRAY_SET: {
+    lbl_ARRAY_SET: case OP_ARRAY_SET: {
         Value val   = POP();
         Value idx_v = POP();
         Value arr_v = POP();
@@ -586,7 +844,7 @@ dispatch:;
         PUSH(val);
         DISPATCH();
     }
-    case OP_ARRAY_LEN: {
+    lbl_ARRAY_LEN: case OP_ARRAY_LEN: {
         Value arr_v = POP();
         if (!val_is_obj_kind(arr_v, OBJ_ARRAY)) RUNTIME_ERR("not an array");
         PUSH(val_int(AS_ARRAY(arr_v)->len));
@@ -596,7 +854,7 @@ dispatch:;
     /* ── 인스턴스 필드 ──────────────────────────────────
      * Q7: 인라인 캐시를 통한 O(1) 필드 접근
      */
-    case OP_GET_FIELD: {
+    lbl_GET_FIELD: case OP_GET_FIELD: {
         uint16_t name_idx = READ_U16();
         uint16_t ic_slot  = READ_U16();
         Value obj_v = POP();
@@ -606,7 +864,7 @@ dispatch:;
         PUSH(result);
         DISPATCH();
     }
-    case OP_SET_FIELD: {
+    lbl_SET_FIELD: case OP_SET_FIELD: {
         uint16_t name_idx = READ_U16();
         uint16_t ic_slot  = READ_U16();
         (void)name_idx; (void)ic_slot;
@@ -619,7 +877,7 @@ dispatch:;
     }
 
     /* ── 메서드 호출 ─────────────────────────────────── */
-    case OP_CALL_METHOD: {
+    lbl_CALL_METHOD: case OP_CALL_METHOD: {
         uint16_t name_idx = READ_U16();
         uint8_t  nargs    = READ_BYTE();
         uint16_t ic_slot  = READ_U16();
@@ -637,22 +895,131 @@ dispatch:;
         nf->slot_base = (int)(nf->slots - vm->value_stack);
         frame = nf;
         ip    = frame->ip;
+        UPDATE_FRAME();
         int extra = cl->func->max_locals - nargs;
         for (int i = 0; i < extra; i++) PUSH(val_nil());
         DISPATCH();
     }
 
+    /* ── SAI Fast Path Opcodes ──────────────────────────────────
+     * 타입 체크 없이 직접 연산.
+     * guard 실패(타입이 예상과 다름) → despecialize → generic으로 복원.
+     *
+     * __builtin_expect: 컴파일러에게 "guard는 거의 항상 통과"를 알림.
+     * 이 힌트 덕분에 GCC/Clang은 fast path를 분기 없이 직선 코드로 생성.
+     */
+#define SAI_GUARD_FAIL(fn, generic_op, fallback_expr) do {       \
+    SAI_DESPECIALIZE(fn, generic_op);                            \
+    PUSH(fallback_expr);                                         \
+    DISPATCH();                                                  \
+} while(0)
+
+    lbl_ADD_INT: case OP_ADD_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_int(a.i + b.i));
+        } else {
+            SAI_GUARD_FAIL(frame->closure->func, OP_ADD, arith_add(a,b));
+        }
+        DISPATCH();
+    }
+    lbl_ADD_FLOAT: case OP_ADD_FLOAT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_FLOAT && b.kind==VAL_FLOAT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_float(a.f + b.f));
+        } else {
+            SAI_GUARD_FAIL(frame->closure->func, OP_ADD, arith_add(a,b));
+        }
+        DISPATCH();
+    }
+    lbl_SUB_INT: case OP_SUB_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_int(a.i - b.i));
+        } else {
+            SAI_GUARD_FAIL(frame->closure->func, OP_SUB, arith_sub(a,b));
+        }
+        DISPATCH();
+    }
+    lbl_MUL_INT: case OP_MUL_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_int(a.i * b.i));
+        } else {
+            SAI_GUARD_FAIL(frame->closure->func, OP_MUL, arith_mul(a,b));
+        }
+        DISPATCH();
+    }
+    lbl_LT_INT: case OP_LT_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_bool(a.i < b.i));
+        } else {
+            bool res = (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT) ? a.f<b.f : false;
+            SAI_GUARD_FAIL(frame->closure->func, OP_LT, val_bool(res));
+        }
+        DISPATCH();
+    }
+    lbl_LE_INT: case OP_LE_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_bool(a.i <= b.i));
+        } else {
+            bool res = (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT) ? a.f<=b.f : false;
+            SAI_GUARD_FAIL(frame->closure->func, OP_LE, val_bool(res));
+        }
+        DISPATCH();
+    }
+    lbl_GT_INT: case OP_GT_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_bool(a.i > b.i));
+        } else {
+            bool res = (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT) ? a.f>b.f : false;
+            SAI_GUARD_FAIL(frame->closure->func, OP_GT, val_bool(res));
+        }
+        DISPATCH();
+    }
+    lbl_GE_INT: case OP_GE_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_bool(a.i >= b.i));
+        } else {
+            bool res = (a.kind==VAL_FLOAT&&b.kind==VAL_FLOAT) ? a.f>=b.f : false;
+            SAI_GUARD_FAIL(frame->closure->func, OP_GE, val_bool(res));
+        }
+        DISPATCH();
+    }
+    lbl_EQ_INT: case OP_EQ_INT: {
+        Value b=POP(), a=POP();
+        if (__builtin_expect(a.kind==VAL_INT && b.kind==VAL_INT, 1)) {
+            vm->stats.spec_hits++;
+            PUSH(val_bool(a.i == b.i));
+        } else {
+            SAI_GUARD_FAIL(frame->closure->func, OP_EQ, val_bool(val_equal(a,b)));
+        }
+        DISPATCH();
+    }
+
     /* ── 기타 ───────────────────────────────────────── */
-    case OP_PRINT:
+    lbl_PRINT: case OP_PRINT:
         val_print(POP(), stdout);
         printf("\n");
         DISPATCH();
 
-    case OP_HALT:
+    lbl_HALT: case OP_HALT:
         goto halt;
 
-    default:
-        RUNTIME_ERR("unknown opcode %d", op);
+    lbl_UNKNOWN: default:
+        RUNTIME_ERR("unknown opcode %d", ip[-1]);
     }
 
 do_throw:;
@@ -675,6 +1042,7 @@ do_throw:;
         PUSH(exc);
         frame = &vm->frame_stack[vm->frame_count - 1];
         ip    = tf->catch_ip ? tf->catch_ip : tf->finally_ip;
+        UPDATE_FRAME();
         if (!ip) goto error;
         goto dispatch;
     }
