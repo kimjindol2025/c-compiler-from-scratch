@@ -353,8 +353,26 @@ dispatch:;
 
         Value callee = PEEK(nargs); /* 인수 아래에 있는 callable */
 
+        /* ── OBJ_NATIVE 고속 경로 ────────────────────────────
+         * V가 못 하는 것: 런타임에 어떤 함수든 Value로 호출.
+         * 네이티브 함수는 새 CallFrame 없이 직접 실행.
+         * → FreeLang의 fetch/println/json_parse가 여기서 실행됨.
+         */
+        if (val_is_obj_kind(callee, OBJ_NATIVE)) {
+            ObjNative *nat = AS_NATIVE(callee);
+            if (nat->arity >= 0 && nargs != (uint8_t)nat->arity)
+                RUNTIME_ERR("native '%s': expected %d args got %d",
+                            nat->name, nat->arity, nargs);
+            Value *argv = &vm->value_stack[vm->stack_top - nargs];
+            Value  result = nat->fn(vm, nargs, argv);
+            /* 인수 + callee 팝 후 결과 push */
+            vm->stack_top -= (nargs + 1);
+            PUSH(result);
+            DISPATCH();
+        }
+
         if (!val_is_obj_kind(callee, OBJ_CLOSURE))
-            RUNTIME_ERR("can only call closures");
+            RUNTIME_ERR("can only call closures or natives");
 
         ObjClosure *cl = AS_CLOSURE(callee);
 

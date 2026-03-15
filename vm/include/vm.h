@@ -269,3 +269,21 @@ int  disassemble_instruction(const ObjFunc *fn, int offset, FILE *out);
 /* 클로저 upvalue 캡처/닫기 (vm_closure.c) */
 ObjUpval *vm_capture_upval(VM *vm, Value *slot);
 void      vm_close_upvals(VM *vm, Value *slot);
+
+/* ── 네이티브 함수 & FFI (vm_native.c) ───────────────
+ * V가 못 하는 것의 핵심 구현:
+ * 런타임에 어떤 함수든 VM Value로 등록 → 우리 언어에서 호출
+ */
+ObjNative   *vm_alloc_native(VM *vm, const char *name, NativeFn fn, int arity);
+ObjMap      *vm_alloc_map(VM *vm);
+ObjExternal *vm_alloc_external(VM *vm, void *handle,
+                                ExternalFinalizer fin, const char *type_name);
+
+void  vm_map_set(VM *vm, ObjMap *map, Value key, Value val);
+Value vm_map_get(ObjMap *map, Value key);
+
+/* @fl 어노테이션 런타임 — FreeLang 함수를 전역으로 등록 */
+void vm_define_native(VM *vm, const char *name, NativeFn fn, int arity);
+
+/* 기본 내장 함수 등록 (vm 초기화 후 한 번 호출) */
+void vm_register_builtins(VM *vm);

@@ -30,6 +30,15 @@ typedef enum {
     OBJ_UPVAL,     /* 클로저 캡처 변수 (열린/닫힌 두 상태) */
     OBJ_CLASS,     /* 클래스 디스패치 대상 (인라인 캐시용) */
     OBJ_INSTANCE,  /* 클래스 인스턴스 */
+
+    /* ── V가 못 하는 것들 ──────────────────────────────
+     * V는 컴파일 타임에 모든 것이 고정된다.
+     * 우리 VM은 런타임에 외부 세계를 Value로 흡수한다. */
+
+    OBJ_NATIVE,    /* C/FreeLang 네이티브 함수 — GC 관리 callable */
+    OBJ_FIBER,     /* 일시정지 가능한 실행 컨텍스트 — async의 기반 */
+    OBJ_MAP,       /* 해시맵 — {key: value} 동적 객체 */
+    OBJ_EXTERNAL,  /* 외부 런타임 핸들 (FreeLang/JS 객체를 GC 아래로) */
 } ObjKind;
 
 /*
@@ -197,6 +206,100 @@ typedef struct {
     int       field_count;
 } ObjInstance;
 
+/* ================================================================
+ * OBJ_NATIVE — 네이티브 함수 (C 함수 포인터를 GC Value로)
+ *
+ * V가 못 하는 것 #1:
+ *   V의 FFI는 컴파일 타임에 C 함수를 바인딩한다.
+ *   우리 VM은 런타임에 어떤 함수든 Value로 만들어
+ *   클로저가 캡처하고, 배열에 담고, 다른 함수에 넘길 수 있다.
+ *
+ * 사용 예:
+ *   vm_define_native(vm, "fetch", fl_fetch_impl);
+ *   → globals["fetch"] = ObjNative(fl_fetch_impl)
+ *   → 우리 언어에서: let result = fetch("https://...")
+ * ================================================================ */
+struct VM; /* 전방 선언 */
+typedef Value (*NativeFn)(struct VM *vm, int argc, Value *argv);
+
+typedef struct {
+    Obj       base;
+    const char *name;    /* 디버깅/에러 메시지용 */
+    NativeFn   fn;       /* 실제 C 함수 포인터 */
+    int        arity;    /* -1 = 가변 인수 */
+} ObjNative;
+
+/* ================================================================
+ * OBJ_MAP — 동적 해시맵 {key: value}
+ *
+ * V가 못 하는 것 #2:
+ *   V는 map 타입이 있지만 동적 키를 런타임에 추가하는 건
+ *   제한적이다. 우리 VM은 어떤 Value도 키가 될 수 있다.
+ *   FreeLang의 JS 객체를 그대로 흡수하는 기반이다.
+ * ================================================================ */
+typedef struct {
+    Obj      base;
+    Value   *keys;
+    Value   *vals;
+    int      count;
+    int      cap;
+} ObjMap;
+
+/* ================================================================
+ * OBJ_FIBER — 일시정지 가능한 실행 컨텍스트
+ *
+ * V가 못 하는 것 #3:
+ *   V에는 코루틴/파이버가 없다.
+ *   우리 VM의 frame_stack은 스냅샷을 찍어서 Fiber에 저장하고
+ *   나중에 resume할 수 있다. FreeLang의 Promise 기반 비동기를
+ *   동기 스타일로 쓸 수 있는 기반이다.
+ *
+ * 상태 머신:
+ *   FIBER_SUSPENDED → resume() → FIBER_RUNNING
+ *   FIBER_RUNNING   → yield()  → FIBER_SUSPENDED
+ *   FIBER_RUNNING   → return   → FIBER_DONE
+ * ================================================================ */
+typedef enum {
+    FIBER_SUSPENDED,
+    FIBER_RUNNING,
+    FIBER_DONE,
+    FIBER_ERROR,
+} FiberState;
+
+#define FIBER_STACK_MAX  1024
+#define FIBER_FRAME_MAX  64
+
+typedef struct ObjFiber {
+    Obj        base;
+    FiberState state;
+
+    /* 일시정지된 실행 상태 스냅샷 */
+    Value      stack[FIBER_STACK_MAX];
+    int        stack_top;
+    /* CallFrame은 vm.h에 정의되므로 여기선 raw bytes로 저장 */
+    uint8_t    frames[FIBER_FRAME_MAX * 64]; /* sizeof(CallFrame) ≤ 64 */
+    int        frame_count;
+
+    Value      result;   /* FIBER_DONE 시 최종 반환값 */
+    Value      error;    /* FIBER_ERROR 시 예외 값 */
+} ObjFiber;
+
+/* ================================================================
+ * OBJ_EXTERNAL — 외부 런타임 핸들
+ *
+ * FreeLang/JS 객체를 우리 GC 아래로 가져온다.
+ * GC가 이 객체를 회수할 때 finalizer를 호출해서
+ * 외부 런타임에도 해제를 알린다.
+ * ================================================================ */
+typedef void (*ExternalFinalizer)(void *handle);
+
+typedef struct {
+    Obj                base;
+    void              *handle;      /* FreeLang/JS 객체 포인터 */
+    ExternalFinalizer  finalizer;   /* GC 회수 시 호출 */
+    const char        *type_name;   /* "Promise", "Buffer", "Stream" 등 */
+} ObjExternal;
+
 /* 타입 안전 캐스트 */
 #define AS_STRING(v)   ((ObjString*)  (v).obj)
 #define AS_ARRAY(v)    ((ObjArray*)   (v).obj)
@@ -205,3 +308,7 @@ typedef struct {
 #define AS_UPVAL(v)    ((ObjUpval*)   (v).obj)
 #define AS_CLASS(v)    ((ObjClass*)   (v).obj)
 #define AS_INSTANCE(v) ((ObjInstance*)(v).obj)
+#define AS_NATIVE(v)   ((ObjNative*)  (v).obj)
+#define AS_MAP(v)      ((ObjMap*)     (v).obj)
+#define AS_FIBER(v)    ((ObjFiber*)   (v).obj)
+#define AS_EXTERNAL(v) ((ObjExternal*)(v).obj)

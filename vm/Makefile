@@ -6,18 +6,22 @@ SRC = src/vm_value.c \
       src/vm_bytecode.c \
       src/vm_gc.c \
       src/vm_closure.c \
-      src/vm_exec.c
+      src/vm_exec.c \
+      src/vm_native.c
 
 OBJ = $(SRC:.c=.o)
 
 LIB = libvm.a
 
-all: $(LIB) tests/test_vm
+all: $(LIB) tests/test_vm tests/test_native
 
 $(LIB): $(OBJ)
 	ar rcs $@ $^
 
 tests/test_vm: tests/test_vm.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< -L. $(LIB) $(LDFLAGS)
+
+tests/test_native: tests/test_native.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< -L. $(LIB) $(LDFLAGS)
 
 %.o: %.c

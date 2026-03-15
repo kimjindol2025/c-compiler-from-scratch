@@ -86,6 +86,29 @@ void vm_blacken_object(VM *vm, Obj *obj) {
             vm_mark_value(vm, inst->fields[i]);
         break;
     }
+    /* ── 새 타입들 (V가 못 하는 것의 GC 측) ────────── */
+    case OBJ_NATIVE:
+        /* 함수 포인터 — GC 추적 불필요, 자식 없음 */
+        break;
+    case OBJ_MAP: {
+        ObjMap *map = (ObjMap*)obj;
+        for (int i = 0; i < map->count; i++) {
+            vm_mark_value(vm, map->keys[i]);
+            vm_mark_value(vm, map->vals[i]);
+        }
+        break;
+    }
+    case OBJ_FIBER: {
+        ObjFiber *fb = (ObjFiber*)obj;
+        for (int i = 0; i < fb->stack_top; i++)
+            vm_mark_value(vm, fb->stack[i]);
+        vm_mark_value(vm, fb->result);
+        vm_mark_value(vm, fb->error);
+        break;
+    }
+    case OBJ_EXTERNAL:
+        /* 외부 핸들 — finalizer가 책임짐, 우리 GC는 추적 불필요 */
+        break;
     }
 }
 
@@ -188,6 +211,29 @@ static void sweep(VM *vm) {
                 free(inst->fields);
                 vm->bytes_allocated -= sizeof(ObjInstance);
                 free(inst);
+                break;
+            }
+            case OBJ_NATIVE:
+                vm->bytes_allocated -= sizeof(ObjNative);
+                free(obj);
+                break;
+            case OBJ_MAP: {
+                ObjMap *map = (ObjMap*)obj;
+                free(map->keys);
+                free(map->vals);
+                vm->bytes_allocated -= sizeof(ObjMap);
+                free(map);
+                break;
+            }
+            case OBJ_FIBER:
+                vm->bytes_allocated -= sizeof(ObjFiber);
+                free(obj);
+                break;
+            case OBJ_EXTERNAL: {
+                ObjExternal *ext = (ObjExternal*)obj;
+                if (ext->finalizer) ext->finalizer(ext->handle);
+                vm->bytes_allocated -= sizeof(ObjExternal);
+                free(obj);
                 break;
             }
             }
