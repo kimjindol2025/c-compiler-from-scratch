@@ -1,2 +1,33 @@
+# Build artifacts
 build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Executables
 ccc
+a.out
+*.out
+test_lexer
+test_parser
+
+# Editor & IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Generated files
+*.s
+*.ll
+*.bc
+
+# Test temporaries
+/tmp/
+.backups/
